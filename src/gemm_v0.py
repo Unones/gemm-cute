@@ -1,17 +1,24 @@
 import torch
 import cutlass
 import cutlass.cute as cute
+from math import prod
 
 from cutlass.cute.runtime import from_dlpack
 
 
 @cute.kernel
-def _kernel_gemm_v1(
+def _kernel_gemm_v0(
     mA : cute.Tensor,
     mB : cute.Tensor,
     mC : cute.Tensor,
     mD : cute.Tensor,
     tiled_mma : cute.TiledMma,
+    atom_copy_ab : cute.CopyAtom,
+    atom_copy_cd : cute.CopyAtom,
+    nb_tiles_k : cutlass.Constexpr,
+    M : cutlass.Constexpr,
+    N : cutlass.Constexpr,
+    K : cutlass.Constexpr,
 ):
     """
     Perform a GEMM operation : D = A*B + C.
@@ -35,7 +42,7 @@ def _kernel_gemm_v1(
     
 
 @cute.jit
-def _jit_gemm_v1(
+def _jit_gemm_v0(
     mA : cute.Tensor,
     mB : cute.Tensor,
     mC : cute.Tensor,
@@ -75,6 +82,23 @@ def _jit_gemm_v1(
     )
     ##
 
+
+    ## Set up atom copy for all tensors (no vectorization)
+    op_copy = cute.nvgpu.CopyUniversalOp()
+    atom_copy_ab = cute.make_copy_atom(
+        op_copy,
+        mA.dtype,
+    )
+    
+    atom_copy_cd = cute.make_copy_atom(
+        op_copy,
+        mC.dtype
+    )
+    ##
+    
+    M = cute.size(mA, mode=[0])
+    K = cute.size(mA, mode=[1])
+    N = cute.size(mC, mode=[1])
     
     ## Initializing coordinate tensors and using use of zipped divide
     cA = cute.make_identity_tensor(mA.shape)
@@ -99,6 +123,25 @@ def _jit_gemm_v1(
     cCD = cute.zipped_divide(cCD, tiler_mn)
     ##
 
+    ## Initializing grid and launching kernel
+    nb_warps_per_tile = prod(atom_layout_mnk)
+    nb_threads_per_tile = 32 * nb_warps_per_tile
+    
+    grid_m = cute.ceil_div(M, size_tile_m)
+    grid_n = cute.ceil_div(N, size_tile_n)
+    nb_tiles_k = cute.ceil_div(K, size_tile_k)
+    
+    args = (mA, mB, mC, mD,
+            tiled_mma,
+            atom_copy_ab,
+            atom_copy_cd,
+            nb_tiles_k,
+            M, N, K,)
+    
+    _kernel_gemm_v0(*args).launch(
+        block=[nb_threads_per_tile, 1, 1],
+        grid=[grid_m, grid_n, 1],
+    )
     
     
 
@@ -163,7 +206,7 @@ def _check_tensor_dims(
 
     
     
-def gemm_v1(
+def gemm_v0(
     a : torch.Tensor,
     b : torch.Tensor,
     c : torch.Tensor,
@@ -217,7 +260,7 @@ def gemm_v1(
     c_ = from_dlpack(c)
     d_ = from_dlpack(d)
     
-    _jit_gemm_v1(a_, b_, c_, d_)
+    _jit_gemm_v0(a_, b_, c_, d_)
     
     
     
@@ -234,4 +277,4 @@ if __name__ == "__main__":
     b = torch.randn((K, N), dtype=dtype, device=device)
     c = torch.randn((M, N), dtype=torch.float32, device=device)
     
-    gemm_v1(a, b, c)
+    gemm_v0(a, b, c)
