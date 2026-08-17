@@ -126,6 +126,8 @@ def _jit_gemm_v1(
     mB : cute.Tensor,
     mC : cute.Tensor,
     mD : cute.Tensor,
+    num_bits_per_copy_cd : cutlass.Constexpr,
+    nb_elems_per_copy_cd : cutlass.Constexpr,
 ):
     """
     Call the corresponding kernel for the gemm operation.
@@ -142,6 +144,77 @@ def _jit_gemm_v1(
         The result tensor of shape (M, N).
     
     """
+    
+    ## Set up the tiled MMA (for tensors mA and mB)
+    shape_mnk = (16, 8, 16)
+    op_mma = cute.nvgpu.warp.MmaF16BF16Op(
+        mA.dtype,
+        cutlass.Float32,
+        shape_mnk,
+    )
+    
+    atom_layout_mnk = (2, 2, 1)
+    permutation_mnk = (1, 1, 1)
+    
+    tiled_mma = cute.make_tiled_mma(
+        op_mma,
+        atom_layout_mnk,
+        permutation_mnk,
+    )
+    ##
+    
+    
+    ## Set up the tiled copy (for tensor mC and mD)
+    op_copy = cute.nvgpu.CopyUniversalOp()
+    atom_copy = cute.make_copy_atom(
+        op_copy, 
+        mC.dtype,
+        num_bits_per_copy=num_bits_per_copy_cd,
+    )
+    
+    size_tile_m = shape_mnk[0] * atom_layout_mnk[0]
+    size_tile_n = shape_mnk[1] * atom_layout_mnk[1]
+    size_tile_k = shape_mnk[2] * atom_layout_mnk[2]
+    
+    val_layout = cute.make_layout((1, nb_elems_per_copy_cd), stride=(0, 1))
+    thr_layout = cute.make_layout((size_tile_m, size_tile_n // nb_elems_per_copy_cd), stride=(0, 1))
+    
+    tiler_mn, layout_tv = cute.make_layout_tv(
+        thr_layout,
+        val_layout,
+    )
+    
+    # print(f"The tiler_mn is equal to : {tiler_mn}")
+    
+    tiled_copy = cute.make_tiled_copy(
+        atom_copy,
+        layout_tv,
+        tiler_mn,
+    )
+    ##
+    
+    
+    ## Initializing coordinate tensors and using use of zipped divide
+    cA = cute.make_identity_tensor(mA.shape)
+    cB = cute.make_identity_tensor(mB.shape)
+    cCD = cute.make_identity_tensor(mC.shape)
+    
+    tiler_mk = (size_tile_m, size_tile_k)
+    tiler_nk = (size_tile_n, size_tile_k)
+    
+    mA = cute.zipped_divide(mA, tiler_mk)
+    mB = cute.zipped_divide(mB, tiler_nk)
+    mC = cute.zipped_divide(mC, tiler_mn)
+    mD = cute.zipped_divide(mD, tiler_mn)
+    
+    cA = cute.zipped_divide(cA, tiler_mk)
+    cB = cute.zipped_divide(cB, tiler_nk)
+    cCD = cute.zipped_divide(cCD, tiler_mn)
+    ##
+    
+    ## Initializing the grid & launching kernel
+    
+    
     
     
     
@@ -214,7 +287,10 @@ def gemm_v1(
     # print(f"The number of bytes aligned of ab is equal to {alignment_ab} bytes.")
     # print(f"The number of bytes aligned of c is equal to {alignment_c} bytes.")
     
-    _jit_gemm_v1(a_, b_, c_, d_)
+    # num_bits_per_copy_ab = 8 * alignment_ab
+    num_bits_per_copy_cd = 8 * alignment_c
+    
+    _jit_gemm_v1(a_, b_, c_, d_, num_bits_per_copy_cd, nb_elemms_per_copy_c)
     
     
     
@@ -229,6 +305,6 @@ if __name__ == "__main__":
     
     a = torch.randn((M, K), dtype=dtype, device=device)
     b = torch.randn((K, N), dtype=dtype, device=device)
-    c = torch.randn((M, N), dtype=dtype, device=device)
+    c = torch.randn((M, N), dtype=torch.float32, device=device)
     
     gemm_v1(a, b, c)
