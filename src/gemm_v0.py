@@ -12,6 +12,9 @@ def _kernel_gemm_v0(
     mB : cute.Tensor,
     mC : cute.Tensor,
     mD : cute.Tensor,
+    cA : cute.Tensor,
+    cB : cute.Tensor,
+    cCD : cute.Tensor,
     tiled_mma : cute.TiledMma,
     atom_copy_ab : cute.CopyAtom,
     atom_copy_cd : cute.CopyAtom,
@@ -39,6 +42,44 @@ def _kernel_gemm_v0(
     
     """
     
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()
+    
+    tile_cd = ((None, None), (bidx, bidy))
+    
+    thr_mma = tiled_mma.get_slice(tidx)
+    
+    gC = mC[tile_cd]    # (BS_M, BS_N)
+    gD = mD[tile_cd]    # (BS_M, BS_N)
+    
+    tCgC = thr_mma.partition_C(gC)  # shape ((V_M, V_N), MMA_M, MMA_N)
+    tCgD = thr_mma.partition_C(gD)  # shape ((V_M, V_N), MMA_M, MMA_N)
+    tCcCD = thr_mma.partition_C(cCD[tile_cd])   # shape ((V_M, V_N), MMA_M, MMA_N)
+    
+    rC = cute.make_fragment_like(tCgC, mC.dtype)    # shape ((V_M, V_N), MMA_M, MMA_N)
+    
+    layout = cute.max_common_layout(rC, tCgC)       # (M_L)
+    tCcCD_v = cute.zipped_divide(tCcCD, layout)     # (M_L, V_N)
+                                                    # it should be ((M_L), ((ceil_div(V_M, M_L), V_N), MMA_M, MMA_N))
+                                                    # but MMA_M, MMA_N and ceil_div(V_M, M_L) are equal to 1 so flattened
+
+    pred_CD = cute.make_rmem_tensor(cute.size(tCcCD_v, mode=[1]), cutlass.Boolean)  # (V_N)
+                                                                                    # it should be (ceil_div(V_M, M_L)*V_N*MMA_M*MMA_N)
+                                                                                    # but the terms are equal to 1
+    
+    for i in cutlass.range(cute.size(pred_CD)):
+        pred_CD[i] = cute.elem_less(tCcCD_v[(0, i)], (M, N))
+    
+    if tidx == 0 and bidx == 0 and bidy == 0:
+        cute.printf("The shape of tCgC is equal to : {}", tCgC.layout)
+        cute.printf("The shape of tCcCD is equal to : {}", tCcCD[((0, 1), 0, 0)])
+        cute.printf("The shape of rC is equal to : {}", rC.layout)
+        # cute.printf("The shape of pred_CD is equal to : {}", pred_CD.shape)
+        cute.printf("The max layout is equal to : {}", layout)
+        cute.printf("The zipped divide is equal to : {}", tCcCD_v.layout)
+    
+    cute.copy(atom_copy_cd, tCgC, rC, pred=pred_CD)
+    
     
 
 @cute.jit
@@ -63,6 +104,11 @@ def _jit_gemm_v0(
         The result tensor of shape (M, N).
     
     """
+    _kernel_gemm_v0.set_name_prefix(
+        "kernel_gemm_v0",
+        remove_cutlass_symbol=True,
+        keep_mangled_name=False,
+    )
     
     ## Set up the tiled MMA (for tensors mA and mB)
     shape_mnk = (16, 8, 16)
@@ -92,7 +138,7 @@ def _jit_gemm_v0(
     
     atom_copy_cd = cute.make_copy_atom(
         op_copy,
-        mC.dtype
+        mC.dtype,
     )
     ##
     
@@ -101,27 +147,28 @@ def _jit_gemm_v0(
     N = cute.size(mC, mode=[1])
     
     ## Initializing coordinate tensors and using use of zipped divide
-    cA = cute.make_identity_tensor(mA.shape)
-    cB = cute.make_identity_tensor(mB.shape)
-    cCD = cute.make_identity_tensor(mC.shape)
+    cA = cute.make_identity_tensor(mA.shape)    # (M, K)
+    cB = cute.make_identity_tensor(mB.shape)    # (N, K)
+    cCD = cute.make_identity_tensor(mC.shape)   # (M, N)
     
-    size_tile_m = shape_mnk[0] * atom_layout_mnk[0]
-    size_tile_n = shape_mnk[1] * atom_layout_mnk[1]
-    size_tile_k = shape_mnk[2] * atom_layout_mnk[2]
+    size_tile_m = shape_mnk[0] * atom_layout_mnk[0] # BS_M
+    size_tile_n = shape_mnk[1] * atom_layout_mnk[1] # BS_N
+    size_tile_k = shape_mnk[2] * atom_layout_mnk[2] # BS_K
     
-    tiler_mk = (size_tile_m, size_tile_k)
-    tiler_nk = (size_tile_n, size_tile_k)
-    tiler_mn = (size_tile_m, size_tile_n)
+    tiler_mk = (size_tile_m, size_tile_k)   # (BS_M, BS_K)
+    tiler_nk = (size_tile_n, size_tile_k)   # (BS_N, BS_K)
+    tiler_mn = (size_tile_m, size_tile_n)   # (BS_M, BS_N)
     
-    mA = cute.zipped_divide(mA, tiler_mk)
-    mB = cute.zipped_divide(mB, tiler_nk)
-    mC = cute.zipped_divide(mC, tiler_mn)
-    mD = cute.zipped_divide(mD, tiler_mn)
+    mA = cute.zipped_divide(mA, tiler_mk)   # ((BS_M, BS_K), (M / BS_M, K / BS_K))
+    mB = cute.zipped_divide(mB, tiler_nk)   # ((BS_N, BS_K), (N / BS_N, K / BS_K))
+    mC = cute.zipped_divide(mC, tiler_mn)   # ((BS_M, BS_N), (M / BS_M, N / BS_N))
+    mD = cute.zipped_divide(mD, tiler_mn)   # ((BS_M, BS_N), (M / BS_M, N / BS_N))
     
-    cA = cute.zipped_divide(cA, tiler_mk)
-    cB = cute.zipped_divide(cB, tiler_nk)
-    cCD = cute.zipped_divide(cCD, tiler_mn)
+    cA = cute.zipped_divide(cA, tiler_mk)   # ((BS_M, BS_K), (M / BS_M, K / BS_K))
+    cB = cute.zipped_divide(cB, tiler_nk)   # ((BS_N, BS_K), (N / BS_N, K / BS_K))
+    cCD = cute.zipped_divide(cCD, tiler_mn) # ((BS_M, BS_N), (M / BS_M, N / BS_N))
     ##
+    
 
     ## Initializing grid and launching kernel
     nb_warps_per_tile = prod(atom_layout_mnk)
@@ -132,11 +179,13 @@ def _jit_gemm_v0(
     nb_tiles_k = cute.ceil_div(K, size_tile_k)
     
     args = (mA, mB, mC, mD,
+            cA, cB, cCD,
             tiled_mma,
             atom_copy_ab,
             atom_copy_cd,
             nb_tiles_k,
-            M, N, K,)
+            M, N, K,
+        )
     
     _kernel_gemm_v0(*args).launch(
         block=[nb_threads_per_tile, 1, 1],
@@ -212,7 +261,7 @@ def gemm_v0(
     c : torch.Tensor,
 ):
     """
-    Call the kernel _kernel_gemm_v1 to perform the simplest GEMM possible.
+    Call the kernel _kernel_gemm_v0 to perform the simplest GEMM possible.
     
     The executed operation is : D = A*B + C.
     
@@ -266,15 +315,15 @@ def gemm_v0(
     
     
 if __name__ == "__main__":
-    M = 4
-    N = 4
-    K = 8
+    M = 64
+    N = 64
+    K = 16
     
     device = torch.device("cuda:0")
     dtype = torch.bfloat16
     
     a = torch.randn((M, K), dtype=dtype, device=device)
     b = torch.randn((K, N), dtype=dtype, device=device)
-    c = torch.randn((M, N), dtype=torch.float32, device=device)
+    c = torch.randn((M, N), dtype=dtype, device=device)
     
     gemm_v0(a, b, c)
