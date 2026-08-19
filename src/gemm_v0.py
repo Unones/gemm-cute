@@ -315,9 +315,9 @@ def gemm_v0(
     
     
 if __name__ == "__main__":
-    M = 32
-    N = 16
-    K = 16
+    M = 2048
+    N = 2048
+    K = 2048
     
     torch.manual_seed(43)
     
@@ -330,7 +330,7 @@ if __name__ == "__main__":
     
     d = gemm_v0(a, b, c)
     
-    d_test = a@b +c
+    d_test = (a.float()@b.float() + c.float()).to(dtype=dtype)
     
     # print(f"The output calculated by the kernel is equal to : \n{d}")
     # print(f"The output calculated by PyTorch is equal to : \n{d_test}")

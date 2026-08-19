@@ -3,9 +3,9 @@ import pytest
 
 from gemm_v0 import gemm_v0
 
-@pytest.mark.parametrize("M", [32, 64, 128, 256, 512])
-@pytest.mark.parametrize("N", [16, 32, 64, 128, 256, 512])
-@pytest.mark.parametrize("K", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("M", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("N", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("K", [256, 512, 1024, 2048])
 def test_gemm_v0(M, N, K):
     
     device = torch.device("cuda:0")
@@ -17,7 +17,7 @@ def test_gemm_v0(M, N, K):
     
     d = gemm_v0(a, b, c)
     
-    d_test = a@b +c
+    d_test = (a.float()@b.float() +c.float()).to(dtype=dtype)
     
     # print(f"The output calculated by the kernel is equal to : \n{d}")
     # print(f"The output calculated by PyTorch is equal to : \n{d_test}")

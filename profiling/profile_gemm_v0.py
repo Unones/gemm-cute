@@ -2,9 +2,9 @@ import torch
 from gemm_v0 import gemm_v0
 
 def profile_gemm_v0():
-    M = 256
-    N = 256 
-    K = 256
+    M = 2048
+    N = 2048
+    K = 2048
     
     dtype = torch.bfloat16
     device = torch.device("cuda:0")
