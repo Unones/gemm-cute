@@ -67,21 +67,6 @@ The biggest decision that had to be taken is regarding the data types.
 
 All tensors are in `bf16`. According to the `CuTe DSL` documentation, with such input,
 the accumulator must be in `fp32`.
-I had the possibility to deal with it in two ways.
-
-Either I initialize a tensor in registers with the `fp32` dtype then make every element 
-equals to 0 then use it in an accumulator of the cute.gemm. 
-
-``` python
-rAcc = cute.make_rmem_tensor_like(tCgC, cutlass.Float32)
-rAcc.fill(0.0)
-...
-cute.gemm(tiled_mma, rAcc, tCrA, tCrB, rAcc)
-```
-
-The other way to do it is to promote the rmem tensor after the copy. Indeed, the atom copy
-instanciated in the host code forces the same dtype on both ends.
-The code is the following :
 
 ``` python
 tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)
@@ -95,9 +80,12 @@ cute.gemm(tiled_mma, tCrC_f32, tCrA, tCrB, tCrC_f32)
 tCrC.store(tCrC_f32.load().to(mC.dtype))
 ```
 
-Both versions use the same amount of registers. The first version is used in the kernel 
-`gemm_v0b` and the second kernel is used in the kernel `gemm_v0`. Both use `38 registers`
-per thread.
+The other way to do it is to initialize a tensor in rmem in FP32 at 0.0, use it as an
+accumulator and then do the addition in the end by recasting the accumulator down to BF16.
+
+Both versions compile to 38 registers per thread (NCU, Registers Per Thread). The version above 
+is the one kept: loading C directly as the initial value of the accumulator folds the + C into 
+the MMA chain and removes the epilogue addition entirely.
 
 ## D) Benchmark
 
@@ -155,12 +143,7 @@ are the symptom, the request flood is the cause.
 
 Two things produce that flood, and both are visible in the kernel.
 
-Therefore, our kernel is latency-bound because not enough data to feed the tensor cores.
-But one question remains : why is there not enough data while the DRAM transfers little data over 
-time ?
-The answer may be in the high throughputs of the L1 and L2 caches. 
-
-But construction of the kernel, there is no coalescing to get the data from the global memory.
+By construction of the kernel, there is no coalescing to get the data from the global memory.
 All copies follow the same principle in the kernel : 
 
 ```python
@@ -191,8 +174,8 @@ We can see here that the uncoalesced TV layout from `thr_mma` is used to copy th
 Therefore, for each and every iteration of the loop, new elements are copied from the global memory to the
 registers. I did not put into place any strategies to store in the `shared memory` elements that are used
 in the tile. 
-However, the compiler still tries to do its best. Indeed, L1 and L2 caches have an extremely high throughput to
-try and minimize the number of transfers from the global memory to the registers.
+The caches absorb most of these requests - hence the 1.18% DRAM throughput - but absorbing them is
+precisely what saturates the L1/L2 path.
 
 Furthermore, no vectorization has been put in place. Consequently, half of the lines in the SASS code are 
 load instructions from the global memory. Here is one example : 
@@ -203,10 +186,10 @@ LDG.E.U16 R14, desc[UR6][R22.64]
 There is also another pice of advice from the SASS code. Next to each `LDG` instruction, there is marked :
 `75% of this line's global accesses are excessive`. This is another problem to tackle.
 
-
 ## F) Planned Improvements
 
 From what was found in the NCU Report, my first GEMM kernel can benefit from 2 major improvements :
 - using the shared memory to load once all the elements from the tile and reduce consequently all transfer costs
+- use `tiled_copy` to load from gmem to smem and vice-versa
 - using the vectorization up to 128 bits
 
