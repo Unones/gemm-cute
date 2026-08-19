@@ -1,0 +1,25 @@
+import torch
+from gemm_v0 import gemm_v0
+
+def profile_gemm_v0():
+    M = 256
+    N = 256 
+    K = 256
+    
+    dtype = torch.bfloat16
+    device = torch.device("cuda:0")
+    
+    a = torch.randn((M, K), dtype=dtype, device=device)
+    b = torch.randn((K, N), dtype=dtype, device=device)
+    c = torch.randn((M, N), dtype=dtype, device=device)
+    
+    d = gemm_v0(a, b, c)
+    
+    torch.cuda.synchronize()
+    
+    torch.cuda.cudart().cudaProfilerStart()
+    d = gemm_v0(a, b, c)
+    torch.cuda.cudart().cudaProfilerStart()
+    
+if __name__ == "__main__":
+    profile_gemm_v0()
