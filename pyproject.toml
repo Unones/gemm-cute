@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.14.7"
 dependencies = [
+    "matplotlib>=3.11.1",
     "nvidia-cutlass-dsl>=4.7.0",
     "pytest>=9.1.1",
     "torch>=2.13.0",

@@ -91,7 +91,7 @@ def _kernel_gemm_v0(
 
 
 @cute.jit
-def _jit_gemm_v0(
+def _kernel_host_gemm_v0(
     mA : cute.Tensor,
     mB : cute.Tensor,
     mC : cute.Tensor,
@@ -307,7 +307,7 @@ def gemm_v0(
     c_ = from_dlpack(c)
     d_ = from_dlpack(d)
     
-    _jit_gemm_v0(a_, b_, c_, d_)
+    _kernel_host_gemm_v0(a_, b_, c_, d_)
     
     return d
     
