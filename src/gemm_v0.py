@@ -49,11 +49,11 @@ def _kernel_gemm_v0(
     tCgC = thr_mma.partition_C(gC)  # shape ((V_M, V_N), MMA_M, MMA_N)
     tCgD = thr_mma.partition_C(gD)  # shape ((V_M, V_N), MMA_M, MMA_N)
     
-    tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)    # shape ((V_M, V_N), MMA_M, MMA_N)
-    rAcc = cute.make_rmem_tensor_like(tCgC, cutlass.Float32)
-    rAcc.fill(0.0)
-    
+    tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)
     cute.copy(atom_copy_cd, tCgC, tCrC,)
+    
+    tCrC_f32 = cute.make_rmem_tensor_like(tCgC, cutlass.Float32)
+    tCrC_f32.store(tCrC.load().to(cutlass.Float32))
     
     ## Creating once the registers for A and B
     tile_a = ((None, None), (bidx, 0))
@@ -82,14 +82,11 @@ def _kernel_gemm_v0(
         cute.copy(atom_copy_ab, tCgA, tCrA,)
         cute.copy(atom_copy_ab, tCgB, tCrB,)
         
-        cute.arch.barrier()
-        
-        cute.gemm(tiled_mma, rAcc, tCrA, tCrB, rAcc)
+        cute.gemm(tiled_mma, tCrC_f32, tCrA, tCrB, tCrC_f32)
     
-    # rAcc = rAcc.to(mC.dtype)
-    # rAcc += tCrC.load()
+    tCrC.store(tCrC_f32.load().to(mC.dtype))
     
-    # cute.copy(atom_copy_cd, rAcc, tCgD)
+    cute.copy(atom_copy_cd, tCrC, tCgD)
 
 
 
@@ -145,13 +142,11 @@ def _jit_gemm_v0(
     atom_copy_ab = cute.make_copy_atom(
         op_copy,
         mA.dtype,
-        num_bits_per_copy=16,
     )
     
     atom_copy_cd = cute.make_copy_atom(
         op_copy,
         mC.dtype,
-        num_bits_per_copy=16,
     )
     ##
     
@@ -320,9 +315,11 @@ def gemm_v0(
     
     
 if __name__ == "__main__":
-    M = 64
-    N = 64
+    M = 32
+    N = 16
     K = 16
+    
+    torch.manual_seed(43)
     
     device = torch.device("cuda:0")
     dtype = torch.bfloat16
@@ -335,4 +332,7 @@ if __name__ == "__main__":
     
     d_test = a@b +c
     
-    # torch.testing.assert_close(d, d_test)
+    # print(f"The output calculated by the kernel is equal to : \n{d}")
+    # print(f"The output calculated by PyTorch is equal to : \n{d_test}")
+    
+    torch.testing.assert_close(d, d_test, atol=1e-2, rtol=1e-2)
