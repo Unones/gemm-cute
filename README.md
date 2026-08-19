@@ -20,40 +20,46 @@ There are no `swizzling`, use of `shared memory` and whatever else.
 From this basic kernel, I will implement in future version of this GEMM kernel 
 predicates, use of shared memory, swizzling, ...
 
-## B) Memory or Compute Bound ?
+## B) Memory or Compute Bound?
 
-In every kernel, the ridge point of the `Arithmetic Intensity` will be kept the same.
-It is certain that every kernel will have a unique ridge point depending on the 
-transfers from global memory to another part of the memory in the GPU (L2, L1, registers).
+The ridge point is a property of the hardware, not of the kernel: it is the same for
+every version in this repo. All measurements are taken on an RTX 5070 Ti with the core
+clock locked at 2.30 GHz, where the BF16-input / FP32-accumulation tensor throughput is
+`82.5 TFLOP/s`. Locking the core clock does not affect memory bandwidth, which stays at
+`896 GB/s`. Hence:
 
-However, this base ridge point will serve as a minimum to know approximately where the kernels
-will transition from being memory-bound to being compute-bound.
+> ridge point = 82.5 TFLOP/s ÷ 896 GB/s ≈ **92 FLOPs/byte**
 
-The definition of the `Arithmetic Intensity` is the following : 
-` AI = FLOPs / Bytes transferred from memory`
+What changes from one version to the next is the arithmetic intensity
+`AI = FLOPs / bytes`, since each kernel moves a different amount of data.
 
-The total number of FLOPs from the matrix multiplication is equal to : `2 * M * N * K`.
-The total number of bytes transferred from memory (with the dtype `bf16`) is equal to : 
-`2*M*N + 2*M*K + 2*N*K`.
+The count below is the *algorithmic* one: each tensor is assumed to cross HBM exactly
+once, repeated tile loads being served from cache. It is therefore an upper bound on AI -
+a kernel that re-fetches its tiles moves more bytes and sits lower. It serves as a common
+reference across versions, not as a description of what v0 actually does.
 
-All tests and profilings will be done on square matrices for simplicity. Therefore : 
-`M = N = K`.
-Consequently, `AI = (2 * M*M*M) / (6 * M*M)`.
-Therefore, `AI = M / 3`.
+The kernel computes `D = A·B + C` with four distinct tensors, all in BF16 (2 bytes/element):
+- load `A` (M, K): `2·M·K`
+- load `B` (N, K): `2·N·K`
+- load `C` (M, N): `2·M·N`
+- store `D` (M, N): `2·M·N`
 
-All compute is done on a RTX 5070 Ti locked at 2.30 GHz. Therefore, the number of TFLOPs
-using tensor cores on BF16-input/FP32-accumulation is equal to `82.5 TFLOP/s`. 
-This GPU has a bandwidth of `896 GB/s`.
-Therefore, the ridge point in this configuration is equal to : `92 FLOPs / byte`.
+FLOPs: `2·M·N·K` for the product; the `M·N` additions of the epilogue are negligible
+against `O(M·N·K)`.
 
-Using the calculation leading to `AI`, a GEMM kernel is memory-bound below `M = 276`
-and compute-bound above `M = 276`.
+All tests and profilings use square matrices, so `M = N = K`:
+- FLOPs = `2·M³`
+- bytes = `8·M²`
+- **`AI = M / 4`**
 
-All sizes in benchmarks wil be powers of 2. Therefore, it is expected to have a kernel
-fully compute-bound at `M = 512` and above.
-To conclude this section, any kernel is supposed to be :
-- memory-bound at `M = 256` and below
-- compute-bound at `M = 512` and above
+The crossover is at `M = 368`, i.e. from `M = 512` onward for power-of-two sizes. Under
+this idealized model, a kernel is expected to be memory-bound at `M = 256` and below,
+compute-bound at `M = 512` and above.
+
+One caveat, which §E will make concrete: the roofline predicts a memory-bound regime only
+*provided the kernel saturates the bandwidth*, and a compute-bound one only provided it
+saturates the tensor cores. A kernel can be limited by something the model does not
+describe - which is exactly what happens to v0.
 
 ## C) Decicions made in the kernel
 
@@ -64,9 +70,7 @@ the accumulator must be in `fp32`.
 I had the possibility to deal with it in two ways.
 
 Either I initialize a tensor in registers with the `fp32` dtype then make every element 
-equals to 0 then use it in an accumulator of the cute.gemm. At the time of adding the 
-elements from `tCrC`, a certain amount of registers would be alive.
-This would work but is not optimized in the way registers are used.
+equals to 0 then use it in an accumulator of the cute.gemm. 
 
 ``` python
 rAcc = cute.make_rmem_tensor_like(tCgC, cutlass.Float32)
@@ -91,9 +95,9 @@ cute.gemm(tiled_mma, tCrC_f32, tCrA, tCrB, tCrC_f32)
 tCrC.store(tCrC_f32.load().to(mC.dtype))
 ```
 
-This allows for maximum precision with the FP32-accumulator and the least amount of registers
-used. Despite being a Blackwell architecture, the `RTX 5070 Ti` does not have a tensor memory 
-to store the accumulator.
+Both versions use the same amount of registers. The first version is used in the kernel 
+`gemm_v0b` and the second kernel is used in the kernel `gemm_v0`. Both use `38 registers`
+per thread.
 
 ## D) Benchmark
 
@@ -131,21 +135,25 @@ The Speed of Light report gives us this information :
 | L2 Cache Throughput | 93.79% |
 | DRAM throughput | 1.18% |
 
-These metrics already give us plenty of information to understand why my kernel is so slow.
+These metrics contradict the prediction of §B, and the way they contradict it is
+informative.
 
-As proven above, with the `Arithmetic Intensity`, this kernel should be compute-bound, meaning
-that the Compute Throughput should be at least above 70% or 80%. 
-However, in this situation, we can see that it is under 26%. Furthermore, the DRAM throughput is
-at less than 2%. Therefore, the kernel is not memory-bound.
+At `M = 2048` the model predicts a compute-bound kernel. Compute throughput sits at
+25.92%: the tensor cores are idle most of the time. But the kernel is not compute-bound
+*and* free of a memory problem either - the memory pipeline is at 93.79%, i.e. saturated.
 
-If a kernel is neither memory-bound nor compute-bound, there are high chances that it is latency-
-bound. This means that the threads (and warps as the MMA insruction is issued with `wmma`) wait 
-a huge part of their time waiting for the data to be in the registers.
+The point is that this saturation does not live in DRAM, which sits at 1.18%. The SOL
+memory figure tracks the L2 throughput exactly (93.79%), with L1 close behind (87.67%):
+what is saturated is the cache/LSU path, not the link to HBM. The kernel is not limited by
+the *volume* of data it moves - it moves very little - but by the *number of memory
+requests* it issues to move it.
 
-This hypothesis can be answered in the NCU report in the `Scheduler Statistics` section. The metric
-to look out for is the `No Elligible` to know the percentage of warps that are waiting idle.
-This metric is at `94.08 %`, which is a considerable amount of time where the warps do absolutely 
-nothing.
+The Scheduler Statistics section shows the consequence: `No Eligible` is at 94.08%,
+meaning that for 94% of cycles a scheduler has no warp ready to issue. The warps are not
+idle for lack of work; they are blocked on loads queued behind a saturated LSU. The stalls
+are the symptom, the request flood is the cause.
+
+Two things produce that flood, and both are visible in the kernel.
 
 Therefore, our kernel is latency-bound because not enough data to feed the tensor cores.
 But one question remains : why is there not enough data while the DRAM transfers little data over 
@@ -193,8 +201,7 @@ LDG.E.U16 R14, desc[UR6][R22.64]
 ```
 
 There is also another pice of advice from the SASS code. Next to each `LDG` instruction, there is marked :
-`75% of this line's global accesses are excessive`. This comes from the fact that only `16 bits` are used while
-the `LDG` instruction fetches `64 bits`. This is another problem to tackle.
+`75% of this line's global accesses are excessive`. This is another problem to tackle.
 
 
 ## F) Planned Improvements
