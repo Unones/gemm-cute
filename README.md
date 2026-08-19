@@ -99,3 +99,107 @@ to store the accumulator.
 
 <img src="benchmarks/figures/benchmark_gemm_v0.png" alt="Comparison kernel_gemm_v0 vs Pytorch on RTX 5070 Ti" width="700">
 
+The benchmark produces the following results with square matrices (clock at `2.30 GHz`):
+
+| Metric | Value Custom kernel | Value PyTorch |
+|---|---|---|
+| Throughput (M = 64) | ~0.07 TFLOP/s | ~0.03 TFLOP/s |
+| Throughput (M = 128) | ~0.6 TFLOP/s | ~0.26 TFLOP/s |
+| Throughput (M = 256) | ~4.8 TFLOP/s | ~2.1 TFLOP/s |
+| Throughput (M = 512) | ~6.0 TFLOP/s | ~17 TFLOP/s |
+| Throughput (M = 1024) | ~6.5 TFLOP/s | ~58 TFLOP/s |
+| Throughput (M = 2048) | ~6.7 TFLOP/s | ~76 TFLOP/s |
+| Throughput (M = 4096) | ~7.0 TFLOP/s | ~79 TFLOP/s |
+
+The maximum compute on this GPU at this locked clock is equal to : `82.5 TFLOP/s`.
+My first GEMM kernel is much lower than the kernel from PyTorch.
+It was to be expected that my kernel would have such low throughput. Let's launch a profiling
+to understand what went wrong exactly.
+
+
+## E) Nsight Compute Report
+
+The profiled shape is `M = N = K = 2048`. The GPU clock is fixed at `2.30 GHz`.
+
+The Speed of Light report gives us this information : 
+
+| Metric | Value |
+|---|---|
+| Compute (SM) throughput | 25.92% |
+| Memory throughput | 93.79% |
+| L1 Cache Throughput | 87.67% |
+| L2 Cache Throughput | 93.79% |
+| DRAM throughput | 1.18% |
+
+These metrics already give us plenty of information to understand why my kernel is so slow.
+
+As proven above, with the `Arithmetic Intensity`, this kernel should be compute-bound, meaning
+that the Compute Throughput should be at least above 70% or 80%. 
+However, in this situation, we can see that it is under 26%. Furthermore, the DRAM throughput is
+at less than 2%. Therefore, the kernel is not memory-bound.
+
+If a kernel is neither memory-bound nor compute-bound, there are high chances that it is latency-
+bound. This means that the threads (and warps as the MMA insruction is issued with `wmma`) wait 
+a huge part of their time waiting for the data to be in the registers.
+
+This hypothesis can be answered in the NCU report in the `Scheduler Statistics` section. The metric
+to look out for is the `No Elligible` to know the percentage of warps that are waiting idle.
+This metric is at `94.08 %`, which is a considerable amount of time where the warps do absolutely 
+nothing.
+
+Therefore, our kernel is latency-bound because not enough data to feed the tensor cores.
+But one question remains : why is there not enough data while the DRAM transfers little data over 
+time ?
+The answer may be in the high throughputs of the L1 and L2 caches. 
+
+But construction of the kernel, there is no coalescing to get the data from the global memory.
+All copies follow the same principle in the kernel : 
+
+```python
+tile_cd = ((None, None), (bidx, bidy))
+gC = mC[tile_cd]
+tCgC = thr_mma.partition_C(gC)
+tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)
+cute.copy(atom_copy_cd, tCgC, tCrC,)
+```
+
+This means that I use the `ThrMma` class instead of using the `ThrCopy` class. The former has a
+specific thread-value layout adapted for the Tensor Cores. The latter can be initialized to have 
+the best thread-value layout to maximize coalescing.
+
+Therefore, in each loop : 
+``` python
+for k in cutlass.range(nb_tiles_k):
+    ...
+    tCgA = thr_mma.partition_A(gA)
+    tCgB = thr_mma.partition_B(gB)
+
+    cute.copy(atom_copy_ab, tCgA, tCrA,)
+    cute.copy(atom_copy_ab, tCgB, tCrB,)
+```
+
+We can see here that the uncoalesced TV layout from `thr_mma` is used to copy the elements from A and B
+(the same problem stands for the tensor C).
+Therefore, for each and every iteration of the loop, new elements are copied from the global memory to the
+registers. I did not put into place any strategies to store in the `shared memory` elements that are used
+in the tile. 
+However, the compiler still tries to do its best. Indeed, L1 and L2 caches have an extremely high throughput to
+try and minimize the number of transfers from the global memory to the registers.
+
+Furthermore, no vectorization has been put in place. Consequently, half of the lines in the SASS code are 
+load instructions from the global memory. Here is one example : 
+```python
+LDG.E.U16 R14, desc[UR6][R22.64]
+```
+
+There is also another pice of advice from the SASS code. Next to each `LDG` instruction, there is marked :
+`75% of this line's global accesses are excessive`. This comes from the fact that only `16 bits` are used while
+the `LDG` instruction fetches `64 bits`. This is another problem to tackle.
+
+
+## F) Planned Improvements
+
+From what was found in the NCU Report, my first GEMM kernel can benefit from 2 major improvements :
+- using the shared memory to load once all the elements from the tile and reduce consequently all transfer costs
+- using the vectorization up to 128 bits
+
