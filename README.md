@@ -94,3 +94,8 @@ tCrC.store(tCrC_f32.load().to(mC.dtype))
 This allows for maximum precision with the FP32-accumulator and the least amount of registers
 used. Despite being a Blackwell architecture, the `RTX 5070 Ti` does not have a tensor memory 
 to store the accumulator.
+
+## D) Benchmark
+
+<img src="benchmarks/figures/benchmark_gemm_v0.png" alt="Comparison kernel_gemm_v0 vs Pytorch on RTX 5070 Ti" width="700">
+
