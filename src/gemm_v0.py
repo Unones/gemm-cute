@@ -6,6 +6,38 @@ from math import prod
 from cutlass.cute.runtime import from_dlpack
 
 
+@cute.jit
+def _set_up_predicates(
+    tCrInput : cute.Tensor,
+    tCgInput : cute.Tensor,
+    tCcInput : cute.Tensor,
+    M_Input : cutlass.Numeric,
+    N_Input : cutlass.Numeric,
+    tidx, bidx, bidy,
+) -> cute.Tensor:
+    """
+    Creates the predicate tensor for the input Tensor.
+    
+    """
+    
+    common_layout_Input = cute.max_common_layout(tCgInput, tCrInput)
+    tCcInput_v = cute.zipped_divide(tCcInput, common_layout_Input)
+    
+    if tidx == 0 and bidx == 0 and bidy == 0:
+        cute.printf("The common layout is equal to : {}", common_layout_Input)
+        cute.printf("The common vector is equal to : %d", cute.max_common_vector(tCrInput, tCgInput))
+        
+    pred_Input = cute.make_rmem_tensor(
+        cute.size(tCcInput_v, mode=[1]),
+        cutlass.Boolean,
+    )
+    
+    for i in cutlass.range(cute.size(pred_Input)):
+        pred_Input[i] = cute.elem_less(tCcInput_v[0,i], (M_Input, N_Input))
+    
+    return pred_Input
+
+
 @cute.kernel
 def _kernel_gemm_v0(
     mA : cute.Tensor,
@@ -56,31 +88,59 @@ def _kernel_gemm_v0(
     tCgD = thr_mma.partition_C(gD)  # shape ((V_M, V_N), MMA_M, MMA_N)
     tCcCD = thr_mma.partition_C(cCD[tile_cd])   # shape ((V_M, V_N), MMA_M, MMA_N)
     
-    rC = cute.make_fragment_like(tCgC, mC.dtype)    # shape ((V_M, V_N), MMA_M, MMA_N)
+    tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)    # shape ((V_M, V_N), MMA_M, MMA_N)
     
-    layout = cute.max_common_layout(rC, tCgC)       # (M_L)
-    tCcCD_v = cute.zipped_divide(tCcCD, layout)     # (M_L, V_N)
-                                                    # it should be ((M_L), ((ceil_div(V_M, M_L), V_N), MMA_M, MMA_N))
-                                                    # but MMA_M, MMA_N and ceil_div(V_M, M_L) are equal to 1 so flattened
-
-    pred_CD = cute.make_rmem_tensor(cute.size(tCcCD_v, mode=[1]), cutlass.Boolean)  # (V_N)
-                                                                                    # it should be (ceil_div(V_M, M_L)*V_N*MMA_M*MMA_N)
-                                                                                    # but the terms are equal to 1
+    rAcc = cute.make_rmem_tensor_like(tCgC, cutlass.Float32)
+    rAcc.fill(0.0)
     
-    for i in cutlass.range(cute.size(pred_CD)):
-        pred_CD[i] = cute.elem_less(tCcCD_v[(0, i)], (M, N))
+    pred_CD = _set_up_predicates(tCrC, tCgC, tCcCD, M, N, tidx, bidx, bidy)
+    
+    cute.copy(atom_copy_cd, tCgC, tCrC, pred=pred_CD)
+    
+    ## Creating once the registers for A and B
+    tile_a = ((None, None), (bidx, 0))
+    tile_b = ((None, None), (bidy, 0))
+    
+    gA = mA[tile_a]
+    gB = mB[tile_b]
+    
+    tCgA = thr_mma.partition_A(gA)
+    tCgB = thr_mma.partition_B(gB)
+    
+    tCrA = cute.make_rmem_tensor_like(tCgA, mA.dtype)
+    tCrB = cute.make_rmem_tensor_like(tCgB, mB.dtype)
+    ##
     
     if tidx == 0 and bidx == 0 and bidy == 0:
-        cute.printf("The shape of tCgC is equal to : {}", tCgC.layout)
-        cute.printf("The shape of tCcCD is equal to : {}", tCcCD[((0, 1), 0, 0)])
-        cute.printf("The shape of rC is equal to : {}", rC.layout)
-        # cute.printf("The shape of pred_CD is equal to : {}", pred_CD.shape)
-        cute.printf("The max layout is equal to : {}", layout)
-        cute.printf("The zipped divide is equal to : {}", tCcCD_v.layout)
+        cute.printf("tCgA is equal to : {}", tCgA.layout)
+        cute.printf("tCrA is equal to : {}", tCrA.layout)
     
-    cute.copy(atom_copy_cd, tCgC, rC, pred=pred_CD)
-    
-    
+    for k in cutlass.range(nb_tiles_k):
+        tile_a = ((None, None), (bidx, k))
+        tile_b = ((None, None), (bidy, k))
+        
+        gA = mA[tile_a]
+        gB = mB[tile_b]
+        
+        tCgA = thr_mma.partition_A(gA)
+        tCgB = thr_mma.partition_B(gB)
+        
+        tCcA = thr_mma.partition_A(cA[tile_a])
+        tCcB = thr_mma.partition_B(cB[tile_b])
+        
+        pred_A = _set_up_predicates(tCrA, tCgA, tCcA, M, K, tidx, bidx, bidy)
+        pred_B = _set_up_predicates(tCrB, tCgB, tCcB, N, K, tidx, bidx, bidy)
+        
+        cute.copy(atom_copy_ab, tCgA, tCrA, pred=pred_A)
+        # cute.copy(atom_copy_ab, tCgB, tCrB, pred=pred_B)
+        
+        # cute.arch.barrier()
+        
+        # cute.gemm(tiled_mma, rAcc, tCrA, tCrB, rAcc)
+        
+
+
+
 
 @cute.jit
 def _jit_gemm_v0(
@@ -134,11 +194,13 @@ def _jit_gemm_v0(
     atom_copy_ab = cute.make_copy_atom(
         op_copy,
         mA.dtype,
+        num_bits_per_copy=16,
     )
     
     atom_copy_cd = cute.make_copy_atom(
         op_copy,
         mC.dtype,
+        num_bits_per_copy=16,
     )
     ##
     
