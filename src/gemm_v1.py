@@ -61,6 +61,17 @@ def _kernel_gemm_v1(
     tAsC = thr_copy_cd.partition_S(sC)
     cute.copy(tiled_copy_cd, tAgC, tAsC)
     
+    cute.arch.barrier()
+    
+    tCsC = thr_mma.partition_C(sC)
+    tCrC = cute.make_rmem_tensor_like(tCsC, mC.dtype)
+    cute.copy(copy_atom_mn, tCsC, tCrC)
+    
+    rAcc = cute.make_rmem_tensor_like(tCsC, cutlass.Float32)
+    rAcc.fill(0.0)
+    
+    rAcc.store(tCrC.load().to(cutlass.Float32))
+    
     for k in cutlass.range(nb_tiles_k):
         tile_a = ((None, None), (bidx, k))
         gA = mA[tile_a]
@@ -73,21 +84,9 @@ def _kernel_gemm_v1(
         tBgB = thr_copy_b.partition_S(gB)
         tBsB = thr_copy_b.partition_D(sB)
         cute.copy(tiled_copy_b, tBgB, tBsB)
+        
+        cute.arch.barrier()
     
-    cute.arch.barrier()
-    ##
-    
-    ## Load from shared memory to registers to compute
-    tCsC = thr_mma.partition_C(sC)
-    tCrC = cute.make_rmem_tensor_like(tCsC, mC.dtype)
-    cute.copy(copy_atom_mn, tCsC, tCrC)
-    
-    rAcc = cute.make_rmem_tensor_like(tCsC, cutlass.Float32)
-    rAcc.fill(0.0)
-    
-    rAcc.store(tCrC.load().to(cutlass.Float32))
-    
-    for k in cutlass.range(nb_tiles_k):
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
         
@@ -98,14 +97,16 @@ def _kernel_gemm_v1(
         cute.copy(copy_atom_nk, tCsB, tCrB)
         
         cute.gemm(tiled_mma, rAcc, tCrA, tCrB, rAcc)
-    
+        
+        cute.arch.barrier()
+
     tCrC.store(rAcc.load().to(mD.dtype))
-    
-    cute.arch.barrier()
     ##
     
     ## Store result back into global memory
     cute.copy(copy_atom_mn, tCrC, tCsC)
+    
+    cute.arch.barrier()
     
     gD = mD[tile_cd]
     
@@ -226,6 +227,10 @@ def _kernel_host_gemm_v1(
     )
     ##
     
+    M = cute.size(mD, mode=[0])
+    N = cute.size(mD, mode=[1])
+    K = cute.size(mA, mode=[1])
+    
     ## Set up the tensors
     mA = cute.zipped_divide(mA, tiler_mk)
     mB = cute.zipped_divide(mB, tiler_nk)
@@ -233,13 +238,11 @@ def _kernel_host_gemm_v1(
     mD = cute.zipped_divide(mD, tiler_mn)
     ##
     
-    ## Initializing the grid
+    ## Initializing the grid and launching the grid
     grid_m = cute.ceil_div(M, bs_m)
     grid_n = cute.ceil_div(N, bs_n)
     nb_tiles_k = cute.ceil_div(K, bs_k)
-    ##
     
-    ## Launching the kernel
     args = (
         mA, mB, mC, mD,
         tiled_mma,
@@ -288,9 +291,9 @@ def gemm_v1(
 
 
 if __name__ == "__main__":
-    M = 64
-    N = 64
-    K = 16
+    M = 256
+    N = 256
+    K = 256
     
     torch.manual_seed(43)
     

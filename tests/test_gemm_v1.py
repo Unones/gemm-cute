@@ -1,12 +1,12 @@
 import torch
 import pytest
 
-from gemm_v0 import gemm_v0
+from gemm_v1 import gemm_v1
 
 @pytest.mark.parametrize("M", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("N", [256, 512, 1024, 2048])
 @pytest.mark.parametrize("K", [256, 512, 1024, 2048])
-def test_gemm_v0(M, N, K):
+def test_gemm_v1(M, N, K):
     
     device = torch.device("cuda:0")
     dtype = torch.bfloat16
@@ -15,7 +15,7 @@ def test_gemm_v0(M, N, K):
     b = torch.randn((K, N), dtype=dtype, device=device)
     c = torch.randn((M, N), dtype=dtype, device=device)
     
-    d = gemm_v0(a, b, c)
+    d = gemm_v1(a, b, c)
     
     d_test = (a.float()@b.float() +c.float()).to(dtype=dtype)
     
