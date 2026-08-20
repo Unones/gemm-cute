@@ -3,9 +3,9 @@ import pytest
 
 from gemm_v1 import gemm_v1
 
-@pytest.mark.parametrize("M", [256, 512, 1024, 2048])
-@pytest.mark.parametrize("N", [256, 512, 1024, 2048])
-@pytest.mark.parametrize("K", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("M", [256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("N", [256, 512, 1024, 2048, 4096])
+@pytest.mark.parametrize("K", [256, 512, 1024, 2048, 4096])
 def test_gemm_v1(M, N, K):
     
     device = torch.device("cuda:0")

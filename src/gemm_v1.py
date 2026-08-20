@@ -144,7 +144,7 @@ def _kernel_host_gemm_v1(
         shape_mnk=shape_mnk,
     )
     
-    atom_layout_mnk = (2, 2, 1)
+    atom_layout_mnk = (4, 4, 1)
     permutation_mnk = (1, 1, 1)
     
     tiled_mma = cute.make_tiled_mma(
