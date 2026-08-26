@@ -72,11 +72,6 @@ def _kernel_gemm_v2(
     
     rAcc.store(tCrC.load().to(cutlass.Float32))
 
-    # if tidx==0 and bidx==0 and bidy==0:
-    #     cute.printf("The layout of tAgC is : {}", tAgC.layout)
-    #     cute.printf("The layout of tCsC is : {}", tCsC.layout)
-
-
     for k in cutlass.range(nb_tiles_k):
         tile_a = ((None, None), (bidx, k))
         gA = mA[tile_a]
@@ -95,12 +90,6 @@ def _kernel_gemm_v2(
         tCsA = thr_mma.partition_A(sA)
         tCsB = thr_mma.partition_B(sB)
         
-        # if tidx==0 and bidx==0 and bidy==0 and k==0:
-            # cute.printf("The layout of tAgA is equal to : {}", tAgA.layout)
-            # cute.printf("The layout of tBgB is equal to : {}", tBgB.layout)
-            # cute.printf("The layout of tCsA is equal to : {}", tCsA.layout)
-            # cute.printf("The layout of tCsB is equal to : {}", tCsB.layout)
-
         tCrA = cute.make_rmem_tensor_like(tCsA, mA.dtype)
         tCrB = cute.make_rmem_tensor_like(tCsB, mB.dtype)
         
@@ -176,7 +165,7 @@ def _kernel_host_gemm_v2(
     bs_n = cute.size(permutation_mnk[1])
     bs_k = cute.size(permutation_mnk[2])
     
-    max_nb_elems_per_thr = 8    # vectorization bf16
+    # print(f"bs_m : {bs_m} || bs_n : {bs_n} || bs_k : {bs_k}")
     
     nb_elems_mk = bs_m * bs_k
     nb_elems_nk = bs_n * bs_k
@@ -207,17 +196,25 @@ def _kernel_host_gemm_v2(
     copy_atom_mk = cute.make_copy_atom(
         op_copy,
         mA.dtype,
-        # num_bits_per_copy=128,
     )
     copy_atom_nk = cute.make_copy_atom(
         op_copy,
         mA.dtype,
-        # num_bits_per_copy=32,
     )
     copy_atom_mn = cute.make_copy_atom(
         op_copy,
         mA.dtype,
-        # num_bits_per_copy=32,
+    )
+    
+    copy_atom_mk_vec = cute.make_copy_atom(
+        op_copy,
+        mA.dtype,
+        num_bits_per_copy=128,
+    )
+    copy_atom_mn_vec = cute.make_copy_atom(
+        op_copy,
+        mA.dtype,
+        num_bits_per_copy=128,
     )
     
     tiler_mk, layout_tv_mk = cute.make_layout_tv(
@@ -234,7 +231,7 @@ def _kernel_host_gemm_v2(
     )
     
     tiled_copy_mk = cute.make_tiled_copy(
-        copy_atom_mk,
+        copy_atom_mk_vec,
         layout_tv_mk,
         tiler_mk,
     )
@@ -244,7 +241,7 @@ def _kernel_host_gemm_v2(
         tiler_nk,
     )
     tiled_copy_mn = cute.make_tiled_copy(
-        copy_atom_mn,
+        copy_atom_mn_vec,
         layout_tv_mn,
         tiler_mn,
     )
@@ -288,9 +285,6 @@ def _kernel_host_gemm_v2(
     
     
     
-    
-    
-
 def gemm_v2(
     a : torch.Tensor,
     b : torch.Tensor,
