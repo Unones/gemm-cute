@@ -72,6 +72,9 @@ def benchmark_gemm_v2():
 
     plt.tight_layout()
     plt.savefig("benchmarks/figures/benchmark_gemm_v2.png", dpi=600, bbox_inches="tight")
+    
+    print(f"The TFLOPs from kernel_v2 are : {results["kernel_v2"]}")
+    print(f"The TFLOPs from pytorch are : {results["pytorch"]}")
 
 
 if __name__ == "__main__":

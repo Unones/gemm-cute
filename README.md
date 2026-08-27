@@ -608,4 +608,60 @@ It is not possible to use vectorization on B without forcing contiguity, which w
 HBM and the registers, which is too costly.
 A full vectorization is only possible on the tensor A and is achieved through this split strategy.
 
-With all these improvements, let's see the benchmark.
+With all these improvements, let's benchmark `gemm_kernel_v2`.
+
+## E) Benchmark
+
+<img src="benchmarks/figures/benchmark_gemm_v2.png" alt="Comparison kernel_gemm_v2 vs Pytorch on RTX 5070 Ti" width="700">
+
+The benchmark produces the following results with square matrices (clock at `2.30 GHz`):
+
+| Metric | Value Custom kernel | Value PyTorch |
+|---|---|---|
+| Throughput (M = 64) | ~0.07 TFLOP/s | ~0.03 TFLOP/s |
+| Throughput (M = 128) | ~0.6 TFLOP/s | ~0.26 TFLOP/s |
+| Throughput (M = 256) | ~4.7 TFLOP/s | ~2.1 TFLOP/s |
+| Throughput (M = 512) | ~19.1 TFLOP/s | ~16 TFLOP/s |
+| Throughput (M = 1024) | ~42.5 TFLOP/s | ~58.7 TFLOP/s |
+| Throughput (M = 2048) | ~44.8 TFLOP/s | ~74.5 TFLOP/s |
+| Throughput (M = 4096) | ~47.4 TFLOP/s | ~77.4 TFLOP/s |
+
+The gap between my kernel and the reference implementation if closing in. However, there is still a gain of `+60%` to be made
+for my kernel.
+
+In the previous section, the option would be to use `cp.async` and `ldmatrix` and use mutli-staging to hide the latency of 
+transfers. The profiling will tell us whether or not this is the right decision to make.
+
+
+## F) Profiling
+
+The profiled shape is `M = N = K = 2048`. The GPU clock is fixed at `2.30 GHz`.
+
+The Speed of Light report gives us this information : 
+
+| Metric | Value |
+|---|---|
+| Compute (SM) throughput | 65.63% |
+| Memory throughput | 84.37% |
+| L1 Cache Throughput | 65.07% |
+| L2 Cache Throughput | 84.37% |
+| DRAM throughput | 8.87% |
+
+The `Compute Throughput` at around `66%` - which is on an increasing trend with the other two kernels - is still behind
+the `Memory Throughput`. Therefore, the kernel is still memory-bound albeit the gap is closing.
+
+When looking at the SASS code, the main reasons for `Warp Stall Sampling` are Long Scoreboard. One line is at `16%` and is
+similar to the instructions revealed in the previous section : 
+
+```
+LDG.E.U16 R32, desc[UR6][R64.64+-0x3000]
+LDG.E.U16 R11, desc[UR6][R64.64+-0x4000]
+...
+PRMT R46, R11, 0x5419, R32
+```
+
+The instruction starting with `PRMT` accounts for `16%` of not issued samples. There are a few other places in the code where
+the threads wait for the data to arrive.
+
+Therefore, to keep the SMs busy, multi-staging seems to be the way. In the next section, I will implement both `cp.async`
+and `ldmatrix`.
