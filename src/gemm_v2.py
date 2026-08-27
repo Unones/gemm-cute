@@ -14,7 +14,6 @@ def _kernel_gemm_v2(
     tiled_mma : cute.TiledMma,
     tiled_copy_a : cute.TiledCopy,
     tiled_copy_b : cute.TiledCopy,
-    tiled_copy_cd : cute.TiledCopy,
     copy_atom_mk : cute.CopyAtom,
     copy_atom_nk : cute.CopyAtom,
     copy_atom_mn : cute.CopyAtom,
@@ -33,7 +32,6 @@ def _kernel_gemm_v2(
     thr_mma = tiled_mma.get_slice(tidx)
     thr_copy_a = tiled_copy_a.get_slice(tidx)
     thr_copy_b = tiled_copy_b.get_slice(tidx)
-    thr_copy_cd = tiled_copy_cd.get_slice(tidx)
     
     ## Set up shared memory
     smem = cutlass.utils.SmemAllocator()
@@ -41,33 +39,24 @@ def _kernel_gemm_v2(
         mA.dtype,
         cute.make_layout((bs_m, bs_k), stride=(bs_k, 1)),
         byte_alignment=16,
+        swizzle=cute.make_swizzle(1, 4, 3),
     )
     sB = smem.allocate_tensor(
         mB.dtype,
         cute.make_layout((bs_n, bs_k), stride=(bs_k, 1)),
         byte_alignment=16,
-    )
-    sC = smem.allocate_tensor(
-        mC.dtype,
-        cute.make_layout((bs_m, bs_n), stride=(bs_n, 1)),
-        byte_alignment=16,
+        swizzle=cute.make_swizzle(1, 4, 3),
     )
     ##
     
     ## Load from global memory to shared memory
     tile_cd = ((None, None), (bidx, bidy))
     gC = mC[tile_cd]
-    tAgC = thr_copy_cd.partition_S(gC)
-    tAsC = thr_copy_cd.partition_S(sC)
-    cute.copy(tiled_copy_cd, tAgC, tAsC)
+    tCgC = thr_mma.partition_C(gC)
+    tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)
+    cute.copy(copy_atom_mn, tCgC, tCrC)
     
-    cute.arch.barrier()
-    
-    tCsC = thr_mma.partition_C(sC)
-    tCrC = cute.make_rmem_tensor_like(tCsC, mC.dtype)
-    cute.copy(copy_atom_mn, tCsC, tCrC)
-    
-    rAcc = cute.make_rmem_tensor_like(tCsC, cutlass.Float32)
+    rAcc = cute.make_rmem_tensor_like(tCgC, cutlass.Float32)
     rAcc.fill(0.0)
     
     rAcc.store(tCrC.load().to(cutlass.Float32))
@@ -104,16 +93,9 @@ def _kernel_gemm_v2(
     ##
     
     ## Store result back into global memory
-    cute.copy(copy_atom_mn, tCrC, tCsC)
-    
-    cute.arch.barrier()
-    
     gD = mD[tile_cd]
-    
-    tAsD = thr_copy_cd.partition_S(sC)
-    tAgD = thr_copy_cd.partition_D(gD)
-    
-    cute.copy(tiled_copy_cd, tAsD, tAgD)
+    tCgD = thr_mma.partition_C(gD)
+    cute.copy(copy_atom_mn, tCrC, tCgD)
     
 
 @cute.jit
@@ -157,15 +139,10 @@ def _kernel_host_gemm_v2(
     )
     ##
     
-    # print(f"tiled_mma is equal to : {tiled_mma}")
-    
-    
     ## Set up the tiled copy
     bs_m = cute.size(permutation_mnk[0])
     bs_n = cute.size(permutation_mnk[1])
     bs_k = cute.size(permutation_mnk[2])
-    
-    # print(f"bs_m : {bs_m} || bs_n : {bs_n} || bs_k : {bs_k}")
     
     nb_elems_mk = bs_m * bs_k
     nb_elems_nk = bs_n * bs_k
@@ -178,19 +155,12 @@ def _kernel_host_gemm_v2(
     nb_elems_per_thr_nk = nb_elems_nk // nb_theads_per_block
     nb_elems_per_thr_mn = nb_elems_mn // nb_theads_per_block
     
-    # print(f"The nb_elems_per_thr_mk is equal to : {nb_elems_per_thr_mk}")
-    # print(f"The nb_elems_per_thr_nk is equal to : {nb_elems_per_thr_nk}")
-    # print(f"The nb_elems_per_thr_mn is equal to : {nb_elems_per_thr_mn}")
-    
     val_layout_mk = cute.make_layout((1, nb_elems_per_thr_mk), stride=(0, 1))
     val_layout_nk = cute.make_layout((1, nb_elems_per_thr_nk), stride=(0, 1))
     val_layout_mn = cute.make_layout((1, nb_elems_per_thr_mn), stride=(0, 1))
     thr_layout_mk = cute.make_layout((bs_m, bs_k//nb_elems_per_thr_mk), stride=(bs_k//nb_elems_per_thr_mk, 1))
     thr_layout_nk = cute.make_layout((bs_n, bs_k // nb_elems_per_thr_nk), stride=(bs_k // nb_elems_per_thr_nk, 1))
     thr_layout_mn = cute.make_layout((bs_m, bs_n // nb_elems_per_thr_mn), stride=(bs_n // nb_elems_per_thr_mn, 1))
-    
-    # print(f"val_layout_mn is equal to : {val_layout_mn}")
-    # print(f"The number of threads needed to launch the kernel is : {thr_layout_mn}")
     
     op_copy = cute.nvgpu.CopyUniversalOp()
     copy_atom_mk = cute.make_copy_atom(
@@ -211,11 +181,6 @@ def _kernel_host_gemm_v2(
         mA.dtype,
         num_bits_per_copy=128,
     )
-    copy_atom_mn_vec = cute.make_copy_atom(
-        op_copy,
-        mA.dtype,
-        num_bits_per_copy=128,
-    )
     
     tiler_mk, layout_tv_mk = cute.make_layout_tv(
         thr_layout_mk,
@@ -225,10 +190,10 @@ def _kernel_host_gemm_v2(
         thr_layout_nk,
         val_layout_nk,
     )
-    tiler_mn, layout_tv_mn = cute.make_layout_tv(
+    tiler_mn, _ = cute.make_layout_tv(
         thr_layout_mn,
         val_layout_mn,
-    )
+    )   
     
     tiled_copy_mk = cute.make_tiled_copy(
         copy_atom_mk_vec,
@@ -239,11 +204,6 @@ def _kernel_host_gemm_v2(
         copy_atom_nk,
         layout_tv_nk,
         tiler_nk,
-    )
-    tiled_copy_mn = cute.make_tiled_copy(
-        copy_atom_mn_vec,
-        layout_tv_mn,
-        tiler_mn,
     )
     ##
     
@@ -268,15 +228,12 @@ def _kernel_host_gemm_v2(
         tiled_mma,
         tiled_copy_mk,
         tiled_copy_nk,
-        tiled_copy_mn,
         copy_atom_mk,
         copy_atom_nk,
         copy_atom_mn,
         nb_tiles_k,
         bs_m, bs_n, bs_k,
     )
-    
-    # print(f"The number of threads per block used to launch the kernel is : {nb_theads_per_block}")
     
     _kernel_gemm_v2(*args).launch(
         block=[nb_theads_per_block, 1, 1],
@@ -310,9 +267,9 @@ def gemm_v2(
 
 
 if __name__ == "__main__":
-    M = 256
-    N = 256
-    K = 256
+    M = 2048
+    N = 2048
+    K = 2048
     
     torch.manual_seed(43)
     
@@ -326,8 +283,5 @@ if __name__ == "__main__":
     d = gemm_v2(a, b, c)
     
     d_test = (a.float()@b.float() + c.float()).to(dtype=dtype)
-    
-    # print(f"The output calculated by the kernel is equal to : \n{d}")
-    # print(f"The output calculated by PyTorch is equal to : \n{d_test}")
     
     torch.testing.assert_close(d, d_test, atol=1e-2, rtol=1e-2)

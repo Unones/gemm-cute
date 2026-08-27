@@ -1,7 +1,7 @@
 import torch
 from gemm_v2 import gemm_v2
 
-def profile_gemm_v0():
+def profile_gemm_v2():
     M = 2048
     N = 2048
     K = 2048
@@ -22,4 +22,4 @@ def profile_gemm_v0():
     torch.cuda.cudart().cudaProfilerStart()
     
 if __name__ == "__main__":
-    profile_gemm_v0()
+    profile_gemm_v2()
