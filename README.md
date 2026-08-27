@@ -416,5 +416,196 @@ The next kernel will do the following:
 The implementation of `cp.async` will be done later on as it is more important to implement correctly everything 
 that exists.
 
-# IV/ GEMM kernelwith full vectorization and bank conflict-less
+# IV/ GEMM kernel with vectorization and solved bank conflicts
 
+## A) Improvements Done
+
+An additional improvement was integrated to use the `permutation_mnk` argument efficiently in the API `make_tiled_mma`.
+Its use is to increase the work that each thread has to do. We will talk about how it works in the next subsection. Here
+are the three adjustements/improvements:
+- a specific `permutation_mnk` to increase the workload by thread
+- the use of swizzling in the definition of tensors in `shared memory`
+- the split of `copy_atoms` to use vectorization
+
+
+## B) The impact of `permutation_mnk`
+
+The guide in the CuTe DSL documentation written by NVIDIA does a great job of explaining in-depth how [`permuation_mnk`](
+    https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/guides/mma/wmma_programming.html#custom-tile-permutation-with-permutation-mnk
+) works.
+
+Both arugments `atom_layout_mnk` and `permutation_mnk` behave quite closely. The former increases the tile imposed by `shape_mnk`
+by increasing the number of warps overall. In this kernel, it was decided to go back to `atom_layout_mnk = (2, 2, 1)` as 
+the total number of elements would be increased by `permutation_mnk`.
+Below is the snippet of how `tiled_mma` was constructed.
+
+
+```python
+shape_mnk = (16, 8, 16)
+
+op_mma = cute.nvgpu.warp.MmaF16BF16Op(
+    mA.dtype,
+    cutlass.Float32,
+    shape_mnk=shape_mnk,
+)
+
+atom_layout_mnk = (2, 2, 1)
+permutation_mnk = (
+    shape_mnk[0]*atom_layout_mnk[0]*2,
+    shape_mnk[1]*atom_layout_mnk[1]*4,
+    shape_mnk[2]*atom_layout_mnk[2],
+)
+
+tiled_mma = cute.make_tiled_mma(
+    op_mma,
+    atom_layout_mnk,
+    permutation_mnk,
+)
+```
+
+As you can see, instead of manipulating a tile of shape `(32, 16, 16)` by 4 warps, the tile in this example is increased 
+to `(64, 64, 16)` and still managed by 4 warps. This increases the workload by thread and impacts the occupancy. It is not
+necessarily a problem, simply a consequence. As more elements live in registers in a single warp, less warps can exist
+in a single block.
+
+Another important point as to why `permuation_mnk` had to be the first improvement implemented. The swizzling I will 
+talk about depends on the shape of the `shared memory` instanciated which depends on the size of the tile. 
+Therefore, instead of doing twice the calculations, I found it better to adjust the size of the tile first and then
+do the calculations on the specific swizzling.
+
+
+## C) Improve the use of `shared memory`
+
+Before explaining the reasoning and decision behind the swizzling chosen to resolve the bank conflicts (i.e. 
+`make_swizzle(1, 4, 3`)), there is one change that needs to be taken care of.
+Indeed, in the `gemm_kernel_v1`, I allocated tensors in shared memory for A, B and C. However, the goal of the
+shared memory is to store elements that are to be used multiple times. The elements from C are only used once
+per tile compared to the tiles of A and B. Therefore, I removed the following snippet of code : 
+
+```python
+sC = smem.allocate_tensor(
+    mC.dtype,
+    cute.make_layout((bs_m, bs_n), stride=(bs_n, 1)),
+    byte_alignment=16,
+)
+```
+
+Now, there are only two tensors in shared memory that are in need of swizzling: `sA` and `sB`. Thanks to the 
+`permuation_mnk` used in the previous subsection, they behave exactly the same way. Indeed, `bs_m = bs_n = 64`.
+Therefore, the reasoning that will be done on the tensor `sA` is exactly the same for the tensor `sB`. They both
+need the same `swizzling` as they have the same sizes and the same tiler : `tiler_mk = tiler_nk`.
+
+Let us take a dive to the elements of A stored in `sA`. First, the shape of `sA` is `(64, 16)`. One element is 
+two bytes as the input tensors are all in `bf16`. Therefore, one `line` of `sA` is 32 bytes.
+
+One other concept is needed to explain bank conflicts and it is how banks work. There are 32 banks that can 
+deliver 4 bytes each in the same cycle. A bank conflict appears when 2 threads from the same warp want to access
+elements that are related to the same bank.
+
+**1. Mapping of `sA` (64, 16) onto banks** (1 bank = 4 bytes = 2 `bf16` elements, hence 8 banks per row)
+
+| Row \ Columns | 0–1 | 2–3 | 4–5 | 6–7 | 8–9 | 10–11 | 12–13 | 14–15 |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| 1 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+| 2 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 |
+| 3 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 |
+| 4 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| ... | ... | ... | ... | ... | ... | ... | ... | ... |
+
+**2. Bit decomposition of an element's address (11 bits)**
+
+| Bits | 10 9 8 7 6 5 | 4 3 2 1 | 0 |
+|---|---|---|---|
+| Meaning | row (2⁶ = 64) | column (2⁴ = 16) | The number of bytes per element |
+
+
+Bank id = bits `6..2` (2 row bits + 3 column bits) = 5 bits = 32 banks.
+
+The notation used in what follows is : `0000 00 | 000 0 | 0`. From right to left:
+- one bit `0` which encodes the bytes of the element. It is the granularity below the element
+- four bits `| 000 0 | ` which encode the position of the element in the row. The space between
+the three bits and the single bit is where the banks are counted. Indeed, the two first bits
+encode 4 bytes which is the granularity of a bank.
+- six bits `0000 00 |` which encore the line the element is. The two bits on the right are used
+to encode the banks from `8 to 32`. The spaces are used to have a better understanding of where
+the banks are in this `(64, 16)` tensor. 
+
+For instance, the bank 1 is associated with the following bytes (this repeats all 4 rows):
+- `00 | 001 0 | 0`
+- `00 | 001 0 | 1`
+- `00 | 001 1 | 0`
+- `00 | 001 1 | 1`
+
+**3. Warp threads and banks accessed (before swizzling)**
+
+| Row \ Columns | 0–1 | 2–3 | 4–5 | 6–7 | 8–9 → 14–15 |
+|---|---|---|---|---|---|
+| 0 | t0 → b0 | t1 → b1 | t2 → b2 | t3 → b3 | unused |
+| 1 | t4 → b8 | t5 → b9 | t6 → b10 | t7 → b11 | unused |
+| 2 | t8 → b16 | t9 → b17 | t10 → b18 | t11 → b19 | unused |
+| 3 | t12 → b24 | t13 → b25 | t14 → b26 | t15 → b27 | unused |
+| 4 | t16 → b0 | t17 → b1 | t18 → b2 | t19 → b3 | unused |
+| 5 | t20 → b8 | t21 → b9 | t22 → b10 | t23 → b11 | unused |
+| 6 | t24 → b16 | t25 → b17 | t26 → b18 | t27 → b19 | unused |
+| 7 | t28 → b24 | t29 → b25 | t30 → b26 | t31 → b27 | unused |
+
+We can see here that there is a 2-way conflict. Indeed, in each cycle, two threads are assigned the same bank 
+while half of the bnaks are unused. The goal of the swizzling is to use all the banks at the same time.
+Let's use the threads `t0` and `t16` as an example to understand what the swizzling should be.
+
+
+**4. Putting the swizzling into place**
+
+The adress of the thread `t16` and its two elements are the following:
+- `0001 00 | 000 0 | 0` (element 0 at the row 4)
+- `0001 00 | 000 1 | 0` (element 1 at the row 4)
+
+We want the first element to go to the location 8 at the row 0 and the second element to go to the location
+8 at the row 0. The transformation is as follows :
+- `0001 00 | 000 0 | 0` -> `0000 00 | 100 0 | 0`
+- `0001 00 | 000 1 | 0` -> `0000 00 | 100 1 | 0`
+
+Therefore, there is a MBase of `4 bits`, the first four bits. They are never touched and must be the same 
+at the start and the finish. To find `B` and `S`, there is a sure method : the bit `M+S+k` directs the bit
+`M+k` for k going from 0 to `B-1`.
+
+In our case, it is the seventh bit (bit 6) which directs the fourth bit (bit 3). Therefore:
+- `M=4`
+- `S=3`
+- `B=1`
+
+The API to use the swizzling is : `cute.make_swizzle(b, m, s)`. Hence the `Swizzle(1, 4, 3)`.
+
+## D) Improved vectorization
+
+To use a vectorization in the tiled_copy with `num_bits_per_copy=128`, we define another `copy_atom`.
+
+```python
+copy_atom_mk_vec = cute.make_copy_atom(
+    op_copy,
+    mA.dtype,
+    num_bits_per_copy=128,
+)
+
+...
+
+tiled_copy_mk = cute.make_tiled_copy(
+    copy_atom_mk_vec,
+    layout_tv_mk,
+    tiler_mk,
+)
+```
+
+As A is contiguous and aligned on at least 16 bytes with `assumed_aligned=16`, then the vectorization is possible.
+However, for B with the input shape `(K, N)`, vectorized accessed are not possible because of :
+
+```python
+b = b.permute(1, 0)
+```
+
+It is not possible to use vectorization on B without forcing contiguity, which would mean a back-and-forth between the
+HBM and the registers, which is too costly.
+A full vectorization is only possible on the tensor A and is achieved through this split strategy.
+
+With all these improvements, let's see the benchmark.

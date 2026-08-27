@@ -1,3 +1,7 @@
+import os
+os.environ["CUTE_DSL_KEEP_PTX"] = "1"
+os.environ["CUTE_DSL_KEEP_SASS"] = "1"
+
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -291,9 +295,9 @@ def gemm_v3(
 
 
 if __name__ == "__main__":
-    M = 256
-    N = 256
-    K = 256
+    M = 2048
+    N = 2048
+    K = 2048
     
     torch.manual_seed(43)
     
