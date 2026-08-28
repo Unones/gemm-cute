@@ -16,17 +16,153 @@ def _kernel_gemm_v3(
     tiled_copy_async_mk : cute.TiledCopy,
     tiled_copy_async_nk : cute.TiledCopy,
     copy_atom_s2r : cute.CopyAtom,
-    copy_atom_g2r : cute.CopyAtom,
-    nb_tiled_k : cutlass.Constexpr,
+    copy_atom_mn : cute.CopyAtom,
+    nb_tiles_k : cutlass.Constexpr,
     bs_m : cutlass.Constexpr,
     bs_n : cutlass.Constexpr,
     bs_k : cutlass.Constexpr,
+    num_stages : cutlass.Constexpr,
     
 ):
     """
     
     
     """
+    
+    ## Initiate needed variables
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, bidy, _ = cute.arch.block_idx()
+    
+    thr_copy_mk = tiled_copy_async_mk.get_slice(tidx)
+    thr_copy_nk = tiled_copy_async_nk.get_slice(tidx)
+    thr_mma = tiled_mma.get_slice(tidx)
+    
+    smem = cutlass.utils.SmemAllocator()
+    sA = smem.allocate_tensor(
+        mA.dtype,
+        cute.make_ordered_layout((bs_m, num_stages*bs_k), order=(1, 0)),
+        byte_alignment=16,
+        # swizzle=cute.make_swizzle(1, 4, 3),
+    )
+    sB = smem.allocate_tensor(
+        mB.dtype,
+        cute.make_ordered_layout((bs_n, num_stages*bs_k), order=(1, 0)),
+        byte_alignment=16,
+        # swizzle=cute.make_swizzle(1, 4, 3),
+    )
+    
+    sA = cute.logical_divide(sA, (None, bs_k))      # dividing sA in num_stages tensors (bs_m, bs_k)
+    sB = cute.logical_divide(sB, (None, bs_k))      # same for sB
+    ##
+    
+    ## Loading C elements to reegisters
+    tile_cd = ((None, None), (bidx, bidy))
+    
+    gC = mC[tile_cd]
+    tCgC = thr_mma.partition_C(gC)
+    tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)
+    
+    cute.copy(copy_atom_mn, tCgC, tCrC)
+    
+    rAcc = cute.make_rmem_tensor_like(tCrC, cutlass.Float32)
+    rAcc.fill(0.0)
+    rAcc.store(tCrC.load().to(cutlass.Float32))
+    ##
+    
+    ## Prologue for async copy
+    for i in cutlass.range(num_stages - 1):
+        
+        # if tidx==0 and bidx==0 and bidy==0:
+        #     cute.printf("The buffer loaded is : %d", i)
+        #     cute.printf("The buffer loaded in shared memory is at the location : %d", i%num_stages)
+        
+        tile_a = ((None, None), (bidx, i))
+        tile_b = ((None, None), (bidy, i))
+        
+        gA = mA[tile_a]
+        gB = mB[tile_b]
+        
+        tAgA = thr_copy_mk.partition_S(gA)
+        tAgB = thr_copy_nk.partition_S(gB)
+        
+        tAsA = thr_copy_mk.partition_D(sA[(None, (None, i))])
+        tAsB = thr_copy_nk.partition_D(sB[(None, (None, i))])
+        
+        # if tidx==0 and bidx==0 and bidy==0:
+        #     cute.printf("The layout os tAgB is : {}", tAgB.layout)
+        #     cute.printf("The layout os tAsB is : {}", tAsB.layout)
+        #     cute.print_tensor(tAsB)
+        #     cute.print_tensor(tAgB)
+        
+        cute.copy(thr_copy_mk, tAgA, tAsA)
+        cute.copy(thr_copy_nk, tAgB, tAsB)
+        cute.arch.cp_async_commit_group()
+    ##
+    
+    ## Main loop
+    for k in cutlass.range(nb_tiles_k):
+                
+        # if tidx==0 and bidx==0 and bidy==0:
+        #     cute.printf("##########################################")
+        #     cute.printf("Iteration of main loop number %d", k)
+        
+        if k <= (nb_tiles_k - num_stages):
+            
+            part_of_tile = (k+num_stages-1)%num_stages
+            
+            # if tidx==0 and bidx==0 and bidy==0:
+            #     cute.printf("The buffer loaded in shared memory is at the location : %d", part_of_tile)
+            
+            tile_a = ((None, None), (bidx, (k+num_stages-1)))
+            tile_b = ((None, None), (bidy, (k+num_stages-1)))
+            
+            gA = mA[tile_a]
+            gB = mB[tile_b]
+            
+            tAgA = thr_copy_mk.partition_S(gA)
+            tAgB = thr_copy_nk.partition_S(gB)
+            
+            tAsA = thr_copy_mk.partition_D(sA[(None, (None, part_of_tile))])
+            tAsB = thr_copy_nk.partition_D(sB[(None, (None, part_of_tile))])
+            
+            cute.copy(thr_copy_mk, tAgA, tAsA)
+            cute.copy(thr_copy_nk, tAgB, tAsB)
+            
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(num_stages-1)
+        cute.arch.barrier()
+        
+        # if tidx==0 and bidx==0 and bidy==0:
+        #     cute.printf("The gemm done uses the buffers : %d ", k%num_stages)
+        
+        tile_sA_sB = (None, (None, k%num_stages))
+        
+        tCsA = thr_mma.partition_A(sA[tile_sA_sB])
+        tCsB = thr_mma.partition_B(sB[tile_sA_sB])
+        
+        tCrA = cute.make_rmem_tensor_like(tCsA, mA.dtype)
+        tCrB = cute.make_rmem_tensor_like(tCsB, mB.dtype)
+        
+        # if tidx==0 and bidx==0 and bidy==0 and k==0:
+        #     cute.printf("The layout os tCsA is : {}", tCsA.layout)
+        #     cute.printf("The layout of tCrA is : {}", tCrA.layout)
+        
+        cute.copy(copy_atom_s2r, tCsA, tCrA)
+        cute.copy(copy_atom_s2r, tCsB, tCrB)
+        
+        cute.gemm(tiled_mma, rAcc, tCrA, tCrB, rAcc)
+        
+        cute.arch.barrier()
+    ##
+    
+    ## Epilogue for storing the result in D
+    tCrC.store(rAcc.load().to(cutlass.BFloat16))
+    
+    gD = mD[tile_cd]
+    tCgD = thr_mma.partition_C(gD)
+    
+    cute.copy(copy_atom_mn, tCrC, tCgD)
+    
     
 
 
@@ -36,10 +172,16 @@ def _host_kernel_gemm_v3(
     mB : cute.Tensor,
     mC : cute.Tensor,
     mD : cute.Tensor,
+    num_stages : cutlass.Constexpr,
 ):
     """
     
     """
+    _kernel_gemm_v3.set_name_prefix(
+        "kernel_gemm_v3",
+        remove_cutlass_symbol=True,
+        keep_mangled_name=False,
+    )
     
     ## Instanciating the tiled_mma
     shape_mnk = (16, 8, 16)
@@ -104,12 +246,12 @@ def _host_kernel_gemm_v3(
     )
     ##
     
-    print(f"tiler_mn : {tiler_mn} || tiler_mk : {tiler_mk} || tiler_nk : {tiler_nk}")
+    # print(f"tiler_mn : {tiler_mn} || tiler_mk : {tiler_mk} || tiler_nk : {tiler_nk}")
     
     ## Create copy atoms and tiled copy
     op_atom_async = cute.nvgpu.cpasync.CopyG2SOp()
     op_atom_s2r = cute.nvgpu.CopyS2ROp()
-    op_atom_g2r = cute.nvgpu.CopyG2ROp()
+    op_atom_g2r = cute.nvgpu.CopyUniversalOp()
     
     copy_atom_async_mk = cute.make_copy_atom(
         op_atom_async,
@@ -119,7 +261,7 @@ def _host_kernel_gemm_v3(
     copy_atom_async_nk = cute.make_copy_atom(
         op_atom_async,
         mB.dtype,
-        num_bits_per_copy=16,
+        num_bits_per_copy=128,
     )
 
     tiled_copy_async_mk = cute.make_tiled_copy(
@@ -136,12 +278,12 @@ def _host_kernel_gemm_v3(
     copy_atom_s2r = cute.make_copy_atom(
         op_atom_s2r,
         mA.dtype,
-        num_bits_per_copy=128,
+        num_bits_per_copy=32,
     )
-    copy_atom_g2r = cute.make_copy_atom(
+    copy_atom_mn = cute.make_copy_atom(
         op_atom_g2r,
         mC.dtype,
-        num_bits_per_copy=128,
+        num_bits_per_copy=16,
     )
     ##
     
@@ -167,25 +309,32 @@ def _host_kernel_gemm_v3(
         tiled_copy_async_mk,
         tiled_copy_async_nk,
         copy_atom_s2r,
-        copy_atom_g2r,
+        copy_atom_mn,
         nb_tiles_k,
         bs_m, bs_n, bs_k,
+        num_stages,
     )
     
     _kernel_gemm_v3(*args).launch(
         grid=[grid_m, grid_n, 1],
         block=[nb_threads, 1, 1],
     )
+    ##
     
+    # cA = cute.make_identity_tensor((bs_m, 3*bs_k))
+    # cute.printf("The layout of cA is : {}", cA.layout)
     
+    # cA = cute.logical_divide(cA, (None, bs_k))
+    # cute.printf("The layout of cA after divide is : {}", cA.layout)
     
+    # cute.print_tensor(cA[(None, (None, 1))])
     
 
 def gemm_v3(
     a : torch.Tensor,
     b : torch.Tensor,
     c : torch.Tensor,
-):
+) -> torch.Tensor:
     """
     Perform a GEMM operation : D = A@B +C.
     
@@ -206,7 +355,7 @@ def gemm_v3(
     """
     
     ## Adapting tensor to MMA shapes
-    b = b.permute(1, 0)
+    b = b.permute(1, 0).contiguous()
     
     d = torch.empty_like(c)
     ##
@@ -218,20 +367,33 @@ def gemm_v3(
     d_ = from_dlpack(d, assumed_align=16)
     ##
     
-    _host_kernel_gemm_v3(a_, b_, c_, d_)
+    num_stages = 4
+    
+    _host_kernel_gemm_v3(a_, b_, c_, d_, num_stages)
+    
+    return d
     
     
 
 if __name__ == "__main__":
-    M = 16
-    N = 16
-    K = 16
+    M = 128
+    N = 128
+    K = 128
     
     dtype = torch.bfloat16
     device = torch.device('cuda:0')
+    
+    torch.manual_seed(42)
     
     a = torch.randn((M, K), dtype=dtype, device=device)
     b = torch.randn((K, N), dtype=dtype, device=device)
     c = torch.randn((M, N), dtype=dtype, device=device)
     
-    gemm_v3(a, b, c)
+    d = gemm_v3(a, b, c)
+    
+    d_test = (a.float() @ b.float() + c.float()).to(dtype=dtype)
+    
+    print(f"The calculated output by the kernel is equal to : \n{d}")
+    print(f"The calculated output by PyTorch is equal to : \n{d_test}")
+    
+    torch.testing.assert_close(d, d_test, atol=1e-2, rtol=1e-2)
