@@ -6,6 +6,14 @@ from math import prod
 from cutlass.cute.runtime import from_dlpack
 
 
+@cute.jit
+def _flat_stage(s : cute.Tensor, i : cutlass.Numeric):
+    s_grouped = cute.group_modes(s[(None, (None, None, i))], 1, 3)
+    s_coalesced = cute.coalesce(s_grouped, target_profile=(1, 1))
+    return s_coalesced
+
+
+
 @cute.kernel
 def _kernel_gemm_v3(
     mA : cute.Tensor,
@@ -25,6 +33,8 @@ def _kernel_gemm_v3(
     bs_n : cutlass.Constexpr,
     bs_k : cutlass.Constexpr,
     num_stages : cutlass.Constexpr,
+    nb_k_steps : cutlass.Constexpr,
+    size_atom_k : cutlass.Constexpr,
     
 ):
     """
@@ -47,17 +57,14 @@ def _kernel_gemm_v3(
     smem = cutlass.utils.SmemAllocator()
     sA = smem.allocate_tensor(
         mA.dtype,
-        cute.make_ordered_layout((bs_m, num_stages*bs_k), order=(1, 0)),
-        byte_alignment=16,
+        cute.make_ordered_layout((bs_m, (size_atom_k, nb_k_steps, num_stages)), order=(1, 0)),
+        byte_alignment=128,
     )
     sB = smem.allocate_tensor(
         mB.dtype,
-        cute.make_ordered_layout((bs_n, num_stages*bs_k), order=(1, 0)),
-        byte_alignment=16,
+        cute.make_ordered_layout((bs_n, (size_atom_k, nb_k_steps, num_stages)), order=(1, 0)),
+        byte_alignment=128,
     )
-    
-    sA = cute.logical_divide(sA, (None, bs_k))      # dividing sA in num_stages tensors (bs_m, bs_k)
-    sB = cute.logical_divide(sB, (None, bs_k))      # same for sB
     ##
     
     ## Loading C elements to reegisters
@@ -86,8 +93,8 @@ def _kernel_gemm_v3(
         tAgA = thr_copy_g2s_mk.partition_S(gA)
         tAgB = thr_copy_g2s_nk.partition_S(gB)
         
-        tAsA = thr_copy_g2s_mk.partition_D(sA[(None, (None, i))])
-        tAsB = thr_copy_g2s_nk.partition_D(sB[(None, (None, i))])
+        tAsA = thr_copy_g2s_mk.partition_D(_flat_stage(sA, i))
+        tAsB = thr_copy_g2s_nk.partition_D(_flat_stage(sB, i))
         
         cute.copy(thr_copy_g2s_mk, tAgA, tAsA)
         cute.copy(thr_copy_g2s_nk, tAgB, tAsB)
@@ -97,6 +104,7 @@ def _kernel_gemm_v3(
     ## Main loop
     for k in cutlass.range(nb_tiles_k):
         
+        ## Async copy if not out of bound of tile
         if k <= (nb_tiles_k - num_stages):
             
             part_of_tile = (k+num_stages-1)%num_stages
@@ -110,36 +118,63 @@ def _kernel_gemm_v3(
             tAgA = thr_copy_g2s_mk.partition_S(gA)
             tAgB = thr_copy_g2s_nk.partition_S(gB)
             
-            tAsA = thr_copy_g2s_mk.partition_D(sA[(None, (None, part_of_tile))])
-            tAsB = thr_copy_g2s_nk.partition_D(sB[(None, (None, part_of_tile))])
+            tAsA = thr_copy_g2s_mk.partition_D(_flat_stage(sA, part_of_tile))
+            tAsB = thr_copy_g2s_nk.partition_D(_flat_stage(sB, part_of_tile))
             
             cute.copy(thr_copy_g2s_mk, tAgA, tAsA)
             cute.copy(thr_copy_g2s_nk, tAgB, tAsB)
-            
+        ##
+        
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(num_stages-1)
         cute.arch.barrier()
         
-        tile_sA_sB = (None, (None, k%num_stages))
+        ## First ldmatrix for hiding latency
+        buffer_part = k%num_stages
+        first_part_tile_sA_sB = (None, (None, 0, buffer_part))
         
-        tCsA = thr_copy_s2r_mk.partition_S(sA[tile_sA_sB])
-        tCsB = thr_copy_s2r_nk.partition_S(sB[tile_sA_sB])
+        tCsA = thr_copy_s2r_mk.partition_S(sA[first_part_tile_sA_sB])
+        tCsB = thr_copy_s2r_nk.partition_S(sB[first_part_tile_sA_sB])
         
-        tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA[tile_sA_sB]))
-        tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB[tile_sA_sB]))
+        tCrA_actual = tiled_mma.make_fragment_A(thr_mma.partition_A(sA[first_part_tile_sA_sB]))
+        tCrB_actual = tiled_mma.make_fragment_B(thr_mma.partition_B(sB[first_part_tile_sA_sB]))
         
-        cute.copy(tiled_copy_s2r_mk, tCsA, thr_copy_s2r_mk.retile(tCrA))
-        cute.copy(tiled_copy_s2r_nk, tCsB, thr_copy_s2r_nk.retile(tCrB))
+        cute.copy(tiled_copy_s2r_mk, tCsA, thr_copy_s2r_mk.retile(tCrA_actual))
+        cute.copy(tiled_copy_s2r_nk, tCsB, thr_copy_s2r_nk.retile(tCrB_actual))
+        ##
         
-        cute.gemm(tiled_mma, rAcc, tCrA, tCrB, rAcc)
-        
+        ## Inner Loop to load parts of buffer
+        for k_step in cutlass.range_constexpr(nb_k_steps):
+            
+            tCrA = tCrA_actual
+            tCrB = tCrB_actual
+            
+            if k_step < nb_k_steps -1 :
+                tile_sA_sB = (None, (None, k_step+1, buffer_part))
+                tCsA = thr_copy_s2r_mk.partition_S(sA[tile_sA_sB])
+                tCsB = thr_copy_s2r_nk.partition_S(sB[tile_sA_sB])
+                
+                tCrA_next = tiled_mma.make_fragment_A(thr_mma.partition_A(sA[tile_sA_sB]))
+                tCrB_next = tiled_mma.make_fragment_B(thr_mma.partition_B(sB[tile_sA_sB]))
+                
+                cute.copy(tiled_copy_s2r_mk, tCsA, thr_copy_s2r_mk.retile(tCrA_next))
+                cute.copy(tiled_copy_s2r_nk, tCsB, thr_copy_s2r_nk.retile(tCrB_next))   # problem with compute-sanitizer
+                
+                tCrA_actual = tCrA_next
+                tCrB_actual = tCrB_next
+
+            cute.gemm(tiled_mma, rAcc, tCrA, tCrB, rAcc)
+            
         cute.arch.barrier()
-    ##
+        ##
     
     ## Epilogue for storing the result in D
     tCrC.store(rAcc.load().to(cutlass.BFloat16))
     
-    sD = sA     # reassigning the shared memory buffer to store elements of D
+    sD = cute.make_tensor(
+        sA.iterator,
+        cute.make_ordered_layout((bs_m, bs_n), order=(1, 0)),
+    )
     tCsD = thr_copy_r2s_mn.partition_D(sD)
     
     cute.copy(tiled_copy_r2s_mn, thr_copy_r2s_mn.retile(tCrC), tCsD)
@@ -151,7 +186,7 @@ def _kernel_gemm_v3(
     tAsD = thr_copy_s2g_mn.partition_S(sD)
     
     cute.copy(tiled_copy_s2g_mn, tAsD, tAgD)
-    ##
+    # ##
     
     
 
@@ -184,9 +219,9 @@ def _host_kernel_gemm_v3(
     )
     
     permutation_mnk = (
-        shape_mnk[0] * atom_layout_mnk[0] * 2,
-        shape_mnk[1] * atom_layout_mnk[1] * 4,
-        shape_mnk[2] * atom_layout_mnk[2],
+        shape_mnk[0] * atom_layout_mnk[0] * 2,  # 64
+        shape_mnk[1] * atom_layout_mnk[1] * 4,  # 64
+        shape_mnk[2] * atom_layout_mnk[2],      # 16
     )
     
     tiled_mma = cute.make_tiled_mma(
@@ -202,7 +237,7 @@ def _host_kernel_gemm_v3(
     
     bs_m = cute.size(permutation_mnk[0])
     bs_n = cute.size(permutation_mnk[1])
-    bs_k = cute.size(permutation_mnk[2])
+    bs_k = 64
     ##
     
     ## Set up for tiled_copy
@@ -322,6 +357,8 @@ def _host_kernel_gemm_v3(
     grid_m = cute.ceil_div(M, bs_m)
     grid_n = cute.ceil_div(N, bs_n)
     nb_tiles_k = cute.ceil_div(K, bs_k)
+    nb_k_steps = cute.ceil_div(bs_k, shape_mnk[2])
+    size_atom_k = shape_mnk[2]
     
     args = (
         mA, mB, mC, mD,
@@ -335,15 +372,16 @@ def _host_kernel_gemm_v3(
         copy_atom_g2s_mn,
         nb_tiles_k,
         bs_m, bs_n, bs_k,
-        num_stages, 
+        num_stages,
+        nb_k_steps,
+        size_atom_k,
     )
-    
     _kernel_gemm_v3(*args).launch(
         grid=[grid_m, grid_n, 1],
         block=[nb_threads, 1, 1],
     )
-    ##
     
+    ##
     
 
 def gemm_v3(
@@ -380,7 +418,7 @@ def gemm_v3(
     d_ = from_dlpack(d, assumed_align=16)
     ##
     
-    num_stages = 4
+    num_stages = 2
     
     _host_kernel_gemm_v3(a_, b_, c_, d_, num_stages)
     
