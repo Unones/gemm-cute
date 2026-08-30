@@ -178,7 +178,7 @@ def _host_kernel_gemm_v3(
     
     """
     _kernel_gemm_v3.set_name_prefix(
-        "kernel_gemm_v3",
+        "kernel_gemm_v3_num_stages_2",
         remove_cutlass_symbol=True,
         keep_mangled_name=False,
     )
@@ -312,7 +312,7 @@ def _host_kernel_gemm_v3(
         copy_atom_mn,
         nb_tiles_k,
         bs_m, bs_n, bs_k,
-        num_stages,
+        num_stages, 
     )
     
     _kernel_gemm_v3(*args).launch(
@@ -354,9 +354,6 @@ def gemm_v3(
     
     """
     
-    ## Adapting tensor to MMA shapes
-    b = b.permute(1, 0).contiguous()
-    
     d = torch.empty_like(c)
     ##
     
@@ -386,14 +383,15 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     
     a = torch.randn((M, K), dtype=dtype, device=device)
-    b = torch.randn((K, N), dtype=dtype, device=device)
+    b = torch.randn((N, K), dtype=dtype, device=device)
     c = torch.randn((M, N), dtype=dtype, device=device)
     
     d = gemm_v3(a, b, c)
     
+    b = b.T
     d_test = (a.float() @ b.float() + c.float()).to(dtype=dtype)
     
-    print(f"The calculated output by the kernel is equal to : \n{d}")
-    print(f"The calculated output by PyTorch is equal to : \n{d_test}")
+    # print(f"The calculated output by the kernel is equal to : \n{d}")
+    # print(f"The calculated output by PyTorch is equal to : \n{d_test}")
     
     torch.testing.assert_close(d, d_test, atol=1e-2, rtol=1e-2)

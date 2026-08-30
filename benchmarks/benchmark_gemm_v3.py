@@ -42,7 +42,7 @@ def benchmark_gemm_v3():
         c_ = from_dlpack(c, assumed_align=16)
         d_ = from_dlpack(d, assumed_align=16)
         
-        num_stages=3
+        num_stages=2
 
         compiled = cute.compile(_host_kernel_gemm_v3, a_, b_, c_, d_, num_stages)
 

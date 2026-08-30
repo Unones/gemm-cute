@@ -14,11 +14,12 @@ def test_gemm_v2(M, N, K):
     torch.manual_seed(42)
     
     a = torch.randn((M, K), dtype=dtype, device=device)
-    b = torch.randn((K, N), dtype=dtype, device=device)
+    b = torch.randn((N, K), dtype=dtype, device=device)
     c = torch.randn((M, N), dtype=dtype, device=device)
     
     d = gemm_v3(a, b, c)
     
+    b = b.T
     d_test = (a.float()@b.float() +c.float()).to(dtype=dtype)
     
     torch.testing.assert_close(d, d_test, atol=1e-2, rtol=1e-2)
