@@ -55,16 +55,19 @@ def _kernel_gemm_v3(
     thr_mma = tiled_mma.get_slice(tidx)
     
     smem = cutlass.utils.SmemAllocator()
-    sA = smem.allocate_tensor(
-        mA.dtype,
-        cute.make_ordered_layout((bs_m, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3))),
-        byte_alignment=128,
-    )
-    sB = smem.allocate_tensor(
-        mB.dtype,
-        cute.make_ordered_layout((bs_n, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3))),
-        byte_alignment=128,
-    )
+
+    sA_outer = cute.make_ordered_layout((bs_m, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3)))
+    sB_outer = cute.make_ordered_layout((bs_n, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3)))
+    sD_outer = cute.make_ordered_layout((bs_m, bs_n), order=(1, 0))
+
+    sw_128B = cute.make_swizzle(3, 4, 3)   # chunk 16 B ^ (ligne % 8), lignes de 128 B
+    sw_256B = cute.make_swizzle(3, 4, 4)   # chunk 16 B ^ (ligne % 8), lignes de 256 B
+
+    ptr_a = smem.allocate(cute.cosize(sA_outer) * mA.dtype.width // 8, byte_alignment=128)
+    ptr_b = smem.allocate(cute.cosize(sB_outer) * mB.dtype.width // 8, byte_alignment=128)
+
+    sA = cute.make_tensor(cute.recast_ptr(ptr_a, sw_128B, dtype=mA.dtype), sA_outer)
+    sB = cute.make_tensor(cute.recast_ptr(ptr_b, sw_128B, dtype=mB.dtype), sB_outer)
     ##
     
     ## Loading C elements to reegisters
@@ -171,10 +174,7 @@ def _kernel_gemm_v3(
     ## Epilogue for storing the result in D
     tCrC.store(rAcc.load().to(cutlass.BFloat16))
     
-    sD = cute.make_tensor(
-        sA.iterator,
-        cute.make_ordered_layout((bs_m, bs_n), order=(1, 0)),
-    )
+    sD = cute.make_tensor(cute.recast_ptr(ptr_a, sw_256B, dtype=mD.dtype), sD_outer)
     tCsD = thr_copy_r2s_mn.partition_D(sD)
     
     cute.copy(tiled_copy_r2s_mn, thr_copy_r2s_mn.retile(tCrC), tCsD)
@@ -219,8 +219,8 @@ def _host_kernel_gemm_v3(
     )
     
     permutation_mnk = (
-        shape_mnk[0] * atom_layout_mnk[0] * 4,  # 128
-        shape_mnk[1] * atom_layout_mnk[1] * 8,  # 128
+        shape_mnk[0] * atom_layout_mnk[0] * 2,  # 128
+        shape_mnk[1] * atom_layout_mnk[1] * 4,  # 128
         shape_mnk[2] * atom_layout_mnk[2],      # 16
     )
     
@@ -237,7 +237,7 @@ def _host_kernel_gemm_v3(
     
     bs_m = cute.size(permutation_mnk[0])
     bs_n = cute.size(permutation_mnk[1])
-    bs_k = 64
+    bs_k = 32
     ##
     
     ## Set up for tiled_copy
