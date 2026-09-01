@@ -57,12 +57,12 @@ def _kernel_gemm_v3(
     smem = cutlass.utils.SmemAllocator()
     sA = smem.allocate_tensor(
         mA.dtype,
-        cute.make_ordered_layout((bs_m, (size_atom_k, nb_k_steps, num_stages)), order=(1, 0)),
+        cute.make_ordered_layout((bs_m, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3))),
         byte_alignment=128,
     )
     sB = smem.allocate_tensor(
         mB.dtype,
-        cute.make_ordered_layout((bs_n, (size_atom_k, nb_k_steps, num_stages)), order=(1, 0)),
+        cute.make_ordered_layout((bs_n, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3))),
         byte_alignment=128,
     )
     ##
@@ -219,8 +219,8 @@ def _host_kernel_gemm_v3(
     )
     
     permutation_mnk = (
-        shape_mnk[0] * atom_layout_mnk[0] * 2,  # 64
-        shape_mnk[1] * atom_layout_mnk[1] * 4,  # 64
+        shape_mnk[0] * atom_layout_mnk[0] * 4,  # 128
+        shape_mnk[1] * atom_layout_mnk[1] * 8,  # 128
         shape_mnk[2] * atom_layout_mnk[2],      # 16
     )
     
