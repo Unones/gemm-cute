@@ -60,8 +60,8 @@ def _kernel_gemm_v3(
     sB_outer = cute.make_ordered_layout((bs_n, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3)))
     sD_outer = cute.make_ordered_layout((bs_m, bs_n), order=(1, 0))
 
-    sw_128B = cute.make_swizzle(3, 4, 3)   # chunk 16 B ^ (ligne % 8), lignes de 128 B
-    sw_256B = cute.make_swizzle(3, 4, 4)   # chunk 16 B ^ (ligne % 8), lignes de 256 B
+    sw_128B = cute.make_swizzle(2, 4, 3)   # chunk 16 B ^ (ligne % 8), lignes de 128 B
+    sw_256B = cute.make_swizzle(2, 4, 4)   # chunk 16 B ^ (ligne % 8), lignes de 256 B
 
     ptr_a = smem.allocate(cute.cosize(sA_outer) * mA.dtype.width // 8, byte_alignment=128)
     ptr_b = smem.allocate(cute.cosize(sB_outer) * mB.dtype.width // 8, byte_alignment=128)
@@ -219,8 +219,8 @@ def _host_kernel_gemm_v3(
     )
     
     permutation_mnk = (
-        shape_mnk[0] * atom_layout_mnk[0] * 2,  # 128
-        shape_mnk[1] * atom_layout_mnk[1] * 4,  # 128
+        shape_mnk[0] * atom_layout_mnk[0] * 2,  # 64
+        shape_mnk[1] * atom_layout_mnk[1] * 4,  # 64
         shape_mnk[2] * atom_layout_mnk[2],      # 16
     )
     
