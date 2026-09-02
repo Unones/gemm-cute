@@ -27,11 +27,10 @@ def _kernel_gemm_v3(
     tiled_copy_s2r_nk : cute.TiledCopy,
     tiled_copy_s2g_mn : cute.TiledCopy,
     tiled_copy_r2s_mn : cute.TiledCopy,
-    copy_atom_g2s_mn : cute.CopyAtom,
+    tiled_copy_s2r_mn : cute.TiledCopy,
     nb_tiles_k : cutlass.Constexpr,
     bs_m : cutlass.Constexpr,
     bs_n : cutlass.Constexpr,
-    bs_k : cutlass.Constexpr,
     num_stages : cutlass.Constexpr,
     nb_k_steps : cutlass.Constexpr,
     size_atom_k : cutlass.Constexpr,
@@ -52,36 +51,48 @@ def _kernel_gemm_v3(
     thr_copy_s2r_nk = tiled_copy_s2r_nk.get_slice(tidx)
     thr_copy_r2s_mn = tiled_copy_r2s_mn.get_slice(tidx)
     thr_copy_s2g_mn = tiled_copy_s2g_mn.get_slice(tidx)
+    thr_copy_s2r_mn = tiled_copy_s2r_mn.get_slice(tidx)
     thr_mma = tiled_mma.get_slice(tidx)
     
     smem = cutlass.utils.SmemAllocator()
 
     sA_outer = cute.make_ordered_layout((bs_m, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3)))
     sB_outer = cute.make_ordered_layout((bs_n, (size_atom_k, nb_k_steps, num_stages)), order=(2, (0, 1, 3)))
-    sD_outer = cute.make_ordered_layout((bs_m, bs_n), order=(1, 0))
+    sCD_outer = cute.make_ordered_layout((bs_m, bs_n), order=(1, 0))
 
-    sw_128B = cute.make_swizzle(2, 4, 3)   # chunk 16 B ^ (ligne % 8), lignes de 128 B
-    sw_256B = cute.make_swizzle(2, 4, 4)   # chunk 16 B ^ (ligne % 8), lignes de 256 B
+    sw_64B = cute.make_swizzle(2, 4, 3)
+    sw_128B = cute.make_swizzle(3, 4, 3)
 
     ptr_a = smem.allocate(cute.cosize(sA_outer) * mA.dtype.width // 8, byte_alignment=128)
     ptr_b = smem.allocate(cute.cosize(sB_outer) * mB.dtype.width // 8, byte_alignment=128)
 
-    sA = cute.make_tensor(cute.recast_ptr(ptr_a, sw_128B, dtype=mA.dtype), sA_outer)
-    sB = cute.make_tensor(cute.recast_ptr(ptr_b, sw_128B, dtype=mB.dtype), sB_outer)
+    sA = cute.make_tensor(cute.recast_ptr(ptr_a, sw_64B, dtype=mA.dtype), sA_outer)
+    sB = cute.make_tensor(cute.recast_ptr(ptr_b, sw_64B, dtype=mB.dtype), sB_outer)
     ##
     
-    ## Loading C elements to reegisters
+    ## Loading C elements to registers
     tile_cd = ((None, None), (bidx, bidy))
     
     gC = mC[tile_cd]
+    tAgC = thr_copy_s2g_mn.partition_S(gC)
+    sC = cute.make_tensor(cute.recast_ptr(ptr_a, sw_128B, dtype=mC.dtype), sCD_outer)
+    tAsC = thr_copy_s2g_mn.partition_D(sC)
+    
+    cute.copy(tiled_copy_s2g_mn, tAgC, tAsC)
+    cute.arch.barrier()
+    
     tCgC = thr_mma.partition_C(gC)
     tCrC = cute.make_rmem_tensor_like(tCgC, mC.dtype)
     
-    cute.copy(copy_atom_g2s_mn, tCgC, tCrC)
+    tCsC = thr_copy_s2r_mn.partition_S(sC)
+    
+    cute.copy(tiled_copy_s2r_mn, tCsC, thr_copy_s2r_mn.retile(tCrC))
     
     rAcc = cute.make_rmem_tensor_like(tCrC, cutlass.Float32)
-    rAcc.fill(0.0)
     rAcc.store(tCrC.load().to(cutlass.Float32))
+    
+    cute.arch.barrier()
+    
     ##
     
     ## Prologue for async copy
@@ -161,7 +172,7 @@ def _kernel_gemm_v3(
                 tCrB_next = tiled_mma.make_fragment_B(thr_mma.partition_B(sB[tile_sA_sB]))
                 
                 cute.copy(tiled_copy_s2r_mk, tCsA, thr_copy_s2r_mk.retile(tCrA_next))
-                cute.copy(tiled_copy_s2r_nk, tCsB, thr_copy_s2r_nk.retile(tCrB_next))   # problem with compute-sanitizer
+                cute.copy(tiled_copy_s2r_nk, tCsB, thr_copy_s2r_nk.retile(tCrB_next))
                 
                 tCrA_actual = tCrA_next
                 tCrB_actual = tCrB_next
@@ -174,7 +185,7 @@ def _kernel_gemm_v3(
     ## Epilogue for storing the result in D
     tCrC.store(rAcc.load().to(cutlass.BFloat16))
     
-    sD = cute.make_tensor(cute.recast_ptr(ptr_a, sw_256B, dtype=mD.dtype), sD_outer)
+    sD = cute.make_tensor(cute.recast_ptr(ptr_a, sw_128B, dtype=mD.dtype), sCD_outer)
     tCsD = thr_copy_r2s_mn.partition_D(sD)
     
     cute.copy(tiled_copy_r2s_mn, thr_copy_r2s_mn.retile(tCrC), tCsD)
@@ -186,7 +197,7 @@ def _kernel_gemm_v3(
     tAsD = thr_copy_s2g_mn.partition_S(sD)
     
     cute.copy(tiled_copy_s2g_mn, tAsD, tAgD)
-    # ##
+    ##
     
     
 
@@ -249,13 +260,35 @@ def _host_kernel_gemm_v3(
     nb_elems_per_thr_tile_nk = nb_elems_tile_nk // nb_threads
     nb_elems_per_thr_tile_mn = nb_elems_tile_mn // nb_threads
     
-    val_layout_mk = cute.make_ordered_layout((1, nb_elems_per_thr_tile_mk), order=(1, 0))
-    val_layout_nk = cute.make_ordered_layout((1, nb_elems_per_thr_tile_nk), order=(1, 0))
-    val_layout_mn = cute.make_ordered_layout((1, nb_elems_per_thr_tile_mn), order=(1, 0))
+    nb_max_elems_single_instruction = 128 // (mA.dtype).width
     
-    thr_layout_mk = cute.make_ordered_layout((bs_m, cute.ceil_div(bs_k, nb_elems_per_thr_tile_mk)), order=(1, 0))
-    thr_layout_nk = cute.make_ordered_layout((bs_n ,cute.ceil_div(bs_k, nb_elems_per_thr_tile_nk)), order=(1, 0))
-    thr_layout_mn = cute.make_ordered_layout((bs_m, cute.ceil_div(bs_n, nb_elems_per_thr_tile_mn)), order=(1, 0))
+    values_k = nb_max_elems_single_instruction
+    values_m_mk = nb_elems_per_thr_tile_mk // nb_max_elems_single_instruction
+    values_n_nk = nb_elems_per_thr_tile_nk // nb_max_elems_single_instruction
+    
+    values_n_mn = nb_max_elems_single_instruction
+    values_m_mn = nb_elems_per_thr_tile_mn // nb_max_elems_single_instruction
+    
+    val_layout_mk = cute.make_ordered_layout(
+        (values_m_mk, values_k), 
+        order=(1, 0),
+    )
+    val_layout_nk = cute.make_ordered_layout(
+        (values_n_nk, values_k), 
+        order=(1, 0),
+    )
+    val_layout_mn = cute.make_ordered_layout(
+        (values_m_mn, values_n_mn), 
+        order=(1, 0),
+    )
+    
+    thr_layout_mk = cute.make_ordered_layout((bs_m // values_m_mk, bs_k // values_k), order=(1, 0))
+    thr_layout_nk = cute.make_ordered_layout((bs_n // values_n_nk, bs_k // values_k), order=(1, 0))
+    thr_layout_mn = cute.make_ordered_layout((bs_m // values_m_mn, bs_n // values_k), order=(1, 0))
+    
+    # print(f"val_layout_mk : {val_layout_mk} || val_layout_nk : {val_layout_nk} || val_layout_mn : {val_layout_mn}")
+    # print(f"thr_layout_mk : {thr_layout_mk} || thr_layout_nk : {thr_layout_nk} || thr_layout_mn : {thr_layout_mn}")
+    
     
     tiler_mk, layout_tv_mk = cute.make_layout_tv(
         thr_layout_mk,
@@ -308,6 +341,10 @@ def _host_kernel_gemm_v3(
         cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
         mB.dtype,
     )
+    copy_atom_s2r_mn = cute.make_copy_atom(
+        cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+        mC.dtype,
+    )
     copy_atom_r2s_mn = cute.make_copy_atom(
         cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=False, num_matrices=4),
         mD.dtype,
@@ -329,6 +366,10 @@ def _host_kernel_gemm_v3(
     )
     tiled_copy_s2r_nk = cute.make_tiled_copy_B(
         copy_atom_s2r_nk,
+        tiled_mma,
+    )
+    tiled_copy_s2r_mn = cute.make_tiled_copy_C(
+        copy_atom_s2r_mn,
         tiled_mma,
     )
     tiled_copy_r2s_mn = cute.make_tiled_copy_C(
@@ -369,9 +410,9 @@ def _host_kernel_gemm_v3(
         tiled_copy_s2r_nk,
         tiled_copy_s2g_mn,
         tiled_copy_r2s_mn,
-        copy_atom_g2s_mn,
+        tiled_copy_s2r_mn,
         nb_tiles_k,
-        bs_m, bs_n, bs_k,
+        bs_m, bs_n,
         num_stages,
         nb_k_steps,
         size_atom_k,

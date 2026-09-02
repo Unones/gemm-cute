@@ -1,5 +1,20 @@
 # I/ Results
+Comparison between PyTorch's rerouting to cuBLAS and my CuTe DSL kernel.
 
+- **Hardware:** NVIDIA RTX 5070 Ti (Blackwell, 70 SMs; BF16-input / FP32-accumulation
+tensor-core peak at the locked 2.30 GHz clock: `82.5 TFLOP/s`)
+- **Precision:** BF16 inputs
+- **Dimensions:** A, B, C, D of shape `(M, M)` `M` ranging from `128` to `4096`.
+- **Software:** Python `3.14.7`, NVIDIA CUTLASS DSL `4.7.0`
+
+**GEMM Kernel in CuTe DSL vs cuBLAS**
+
+<img src="benchmarks/figures/benchmark_gemm_v3.png" alt="Comparison kernel_gemm_v3 vs Pytorch on RTX 5070 Ti" width="700">
+
+
+This README walks through the implementations in four steps. First, a naive kernel with the smallest
+amount of optimizations. Then, a second and third kernel which use basic shared memory and vectorization.
+Finally, a fourth kernel using all available instructions and some optimizations of `Ampere-class` hardware.
 
 # II/ The most basic GEMM in CuTe DSL
 
@@ -665,3 +680,73 @@ the threads wait for the data to arrive.
 
 Therefore, to keep the SMs busy, multi-staging seems to be the way. In the next section, I will implement both `cp.async`
 and `ldmatrix`.
+
+# V/ GEMM kernel with async copies and `ldmatrix` \ `stmatrix`
+
+## A) Summary of all improvements
+
+This section will explain all improvements that have been done in the kernel `gemm_kernel_v3`. There have been a lot of them
+and I will not be able to go in-depth. Here is the exhaustive list:
+- use of `shared memory` as buffer for loading and storing in `global memory` the elements from `C` and `D`
+- use of `swizzling` in `shared memory` to avoid bank conflicts related to `ldmatrix` and `stmatrix`
+- use of `cp.async` and multi staging for loading tiles of `A` and `B` in shared memory
+- use of `buffering` for `cute.gemm(...)` by dividing the dimension `bs_k` in smaller tiles adapted to the tensor cores (
+    helps in hiding latency
+)
+- adapting the `val_layout` and `thr_layout` to fully use the sectors from the DRAM (each thread has 16 or more elements of 
+2 bytes meaning that a ld.128 instruction is not enough to load all the elements linked to the thread, had an impact on
+coalescing)
+
+
+## B) Benchmark
+
+<img src="benchmarks/figures/benchmark_gemm_v3.png" alt="Comparison kernel_gemm_v3 vs Pytorch on RTX 5070 Ti" width="700">
+
+The benchmark produces the following results with square matrices (clock at `2.30 GHz`):
+
+| Metric | Value Custom kernel | Value PyTorch |
+|---|---|---|
+| Throughput (M = 64) | ~0.07 TFLOP/s | ~0.03 TFLOP/s |
+| Throughput (M = 128) | ~0.6 TFLOP/s | ~0.26 TFLOP/s |
+| Throughput (M = 256) | ~4.7 TFLOP/s | ~2.0 TFLOP/s |
+| Throughput (M = 512) | ~34.9 TFLOP/s | ~16 TFLOP/s |
+| Throughput (M = 1024) | ~57.0 TFLOP/s | ~58.8 TFLOP/s |
+| Throughput (M = 2048) | ~71.1 TFLOP/s | ~74.4 TFLOP/s |
+| Throughput (M = 4096) | ~75.3 TFLOP/s | ~77.4 TFLOP/s |
+
+There is now a maximum of `3%` of difference between my last kernel and the `cuBLAS` reference routed by PyTorch.
+This a great milestone. The swizzling implemented held the most gains while the coalesced accesses allowed for a `5%`
+improvement.
+
+
+## C) Profiling
+
+At first, the kernel had `num_stages = 4` and `bs_k = 64` which put a huge strain on the number of maximum blocs per SM.
+This was the limiting factor. By lowering both of them to `num_stages = 2` and `bs_k = 32`, there are now 5 blocs per
+SM. 
+
+The profiled shape is `M = N = K = 2048`. The GPU clock is fixed at `2.30 GHz`.
+
+The Speed of Light report gives us this information : 
+
+| Metric | Value |
+|---|---|
+| Compute (SM) throughput | 84.92% |
+| Memory throughput | 70.29% |
+| L1 Cache Throughput | 51.48% |
+| L2 Cache Throughput | 70.29% |
+| DRAM throughput | 11.43% |
+
+We are now, finally, in a compute-bound regime. The `Compute Throughput` is at around `85%` while the `Memory Throughput`
+is at aruond `70%`. The `L1 cache` is at `51.5%` meaning that the `shared memory` is not the bottleneck anymore.
+
+Indeed, to further emphasize on the bottleneck coming from the tensor core pipeline, we can check the SASS source.
+
+```
+HMMA.16816.F32.BF16 R36, R56, R48, R36
+```
+This line is reponsible of `13.71%` of total attributed stalls. A huge majority of them are `Math Pipe Throttle`.
+The first instruction of each new loop awaits for the former instruction to be finished.
+
+
+# VI/ Conclusion
