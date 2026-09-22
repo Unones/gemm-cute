@@ -92,7 +92,6 @@ def _kernel_gemm_v3(
     rAcc.store(tCrC.load().to(cutlass.Float32))
     
     cute.arch.barrier()
-    
     ##
     
     ## Prologue for async copy
@@ -286,10 +285,6 @@ def _host_kernel_gemm_v3(
     thr_layout_nk = cute.make_ordered_layout((bs_n // values_n_nk, bs_k // values_k), order=(1, 0))
     thr_layout_mn = cute.make_ordered_layout((bs_m // values_m_mn, bs_n // values_k), order=(1, 0))
     
-    # print(f"val_layout_mk : {val_layout_mk} || val_layout_nk : {val_layout_nk} || val_layout_mn : {val_layout_mn}")
-    # print(f"thr_layout_mk : {thr_layout_mk} || thr_layout_nk : {thr_layout_nk} || thr_layout_mn : {thr_layout_mn}")
-    
-    
     tiler_mk, layout_tv_mk = cute.make_layout_tv(
         thr_layout_mk,
         val_layout_mk
@@ -303,9 +298,6 @@ def _host_kernel_gemm_v3(
         val_layout_mn,
     )
     ##
-    
-    # print(f"tiler_mn : {tiler_mn} || tiler_mk : {tiler_mk} || tiler_nk : {tiler_nk}")
-    # print(f"bs_m : {bs_m} || bs_n : {bs_n} || bs_k : {bs_k}")
     
     ## Create copy atoms and tiled copy
     op_atom_async = cute.nvgpu.cpasync.CopyG2SOp()
