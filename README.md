@@ -4,7 +4,7 @@ Comparison between PyTorch's rerouting to cuBLAS and my CuTe DSL kernel.
 - **Hardware:** NVIDIA RTX 5070 Ti (Blackwell, 70 SMs; BF16-input / FP32-accumulation
 tensor-core peak at the locked 2.30 GHz clock: `82.5 TFLOP/s`)
 - **Precision:** BF16 inputs
-- **Dimensions:** A, B, C, D of shape `(M, M)` `M` ranging from `128` to `4096`.
+- **Dimensions:** A, B, C, D of shape `(M, M)` `M` ranging from `64` to `4096`.
 - **Software:** Python `3.14.7`, NVIDIA CUTLASS DSL `4.7.0`
 
 **GEMM Kernel in CuTe DSL vs cuBLAS**
@@ -14,7 +14,7 @@ tensor-core peak at the locked 2.30 GHz clock: `82.5 TFLOP/s`)
 
 This README walks through the implementations in four steps. First, a naive kernel with the smallest
 amount of optimizations. Then, a second and third kernel which use basic shared memory and vectorization.
-Finally, a fourth kernel using all available instructions and some optimizations of `Ampere-class` hardware.
+Finally, a fourth kernel using all available instructions and using `Ampere-style instructions`.
 
 # II/ The most basic GEMM in CuTe DSL
 
@@ -431,7 +431,7 @@ The next kernel will do the following:
 The implementation of `cp.async` will be done later on as it is more important to implement correctly everything 
 that exists.
 
-# IV/ GEMM kernel with vectorization and solved bank conflicts
+# IV/ GEMM kernel with vectorization swizzling
 
 ## A) Improvements Done
 
@@ -480,8 +480,8 @@ tiled_mma = cute.make_tiled_mma(
 
 As you can see, instead of manipulating a tile of shape `(32, 16, 16)` by 4 warps, the tile in this example is increased 
 to `(64, 64, 16)` and still managed by 4 warps. This increases the workload by thread and impacts the occupancy. It is not
-necessarily a problem, simply a consequence. As more elements live in registers in a single warp, less warps can exist
-in a single block.
+necessarily a problem, simply a consequence. As more elements live in registers in a single warp, fewer warps can reside
+in a single SM.
 
 Another important point as to why `permuation_mnk` had to be the first improvement implemented. The swizzling I will 
 talk about depends on the shape of the `shared memory` instanciated which depends on the size of the tile. 
@@ -491,8 +491,7 @@ do the calculations on the specific swizzling.
 
 ## C) Improve the use of `shared memory`
 
-Before explaining the reasoning and decision behind the swizzling chosen to resolve the bank conflicts (i.e. 
-`make_swizzle(1, 4, 3`)), there is one change that needs to be taken care of.
+Before explaining the swizzling meant to resolve the bank conflicts, there is one change that needs to be taken care of.
 Indeed, in the `gemm_kernel_v1`, I allocated tensors in shared memory for A, B and C. However, the goal of the
 shared memory is to store elements that are to be used multiple times. The elements from C are only used once
 per tile compared to the tiles of A and B. Therefore, I removed the following snippet of code : 
@@ -572,25 +571,32 @@ Let's use the threads `t0` and `t16` as an example to understand what the swizzl
 
 **4. Putting the swizzling into place**
 
-The adress of the thread `t16` and its two elements are the following:
-- `0001 00 | 000 0 | 0` (element 0 at the row 4)
-- `0001 00 | 000 1 | 0` (element 1 at the row 4)
+The addresses of the two elements of thread `t16` are:
+- `0001 00 | 000 0 | 0` (element 0 at row 4)
+- `0001 00 | 000 1 | 0` (element 1 at row 4)
 
-We want the first element to go to the location 8 at the row 0 and the second element to go to the location
-8 at the row 0. The transformation is as follows :
-- `0001 00 | 000 0 | 0` -> `0000 00 | 100 0 | 0`
-- `0001 00 | 000 1 | 0` -> `0000 00 | 100 1 | 0`
+A swizzle is an XOR: the row bits are kept, only the column bits flip. We want row 4 to use
+columns 8–9 instead of 0–1, i.e. bank 4 instead of bank 0:
+- `0001 00 | 000 0 | 0` -> `0001 00 | 100 0 | 0` (column 8 at row 4)
+- `0001 00 | 000 1 | 0` -> `0001 00 | 100 1 | 0` (column 9 at row 4)
 
-Therefore, there is a MBase of `4 bits`, the first four bits. They are never touched and must be the same 
-at the start and the finish. To find `B` and `S`, there is a sure method : the bit `M+S+k` directs the bit
-`M+k` for k going from 0 to `B-1`.
+In byte addresses, bit 7 drives bit 4. However, CuTe applies swizzles to element offsets,
+not byte addresses. With 2-byte `bf16` elements, byte bit `n` is element bit `n-1`:
+bit 6 drives bit 3.
 
-In our case, it is the seventh bit (bit 6) which directs the fourth bit (bit 3). Therefore:
-- `M=4`
-- `S=3`
-- `B=1`
+With `Swizzle(B, M, S)`, bit `M+S+k` is XORed into bit `M+k` for `k` in `[0, B)`. Hence:
+- `M = 3`
+- `S = 3`
+- `B = 1`
 
-The API to use the swizzling is : `cute.make_swizzle(b, m, s)`. Hence the `Swizzle(1, 4, 3)`.
+The API is `cute.make_swizzle(b, m, s)`, hence `Swizzle(1, 3, 3)`.
+
+
+> **Note:** `gemm_kernel_v2` actually uses `Swizzle(1, 4, 3)`. I first derived the swizzle on
+> byte addresses, whereas CuTe applies it to element offsets. `Swizzle(1, 4, 3)` XORs element
+> bit 7 into bit 4, which leaves rows 0–7 untouched: it does not remove the 2-way conflict
+> described above. The benchmark and profiling of this section are those of v2 as written.
+> The correct `Swizzle(1, 3, 3)` is used in `gemm_kernel_v3`.
 
 ## D) Improved vectorization
 
@@ -612,16 +618,10 @@ tiled_copy_mk = cute.make_tiled_copy(
 )
 ```
 
-As A is contiguous and aligned on at least 16 bytes with `assumed_aligned=16`, then the vectorization is possible.
-However, for B with the input shape `(K, N)`, vectorized accessed are not possible because of :
 
-```python
-b = b.permute(1, 0)
-```
-
-It is not possible to use vectorization on B without forcing contiguity, which would mean a back-and-forth between the
-HBM and the registers, which is too costly.
-A full vectorization is only possible on the tensor A and is achieved through this split strategy.
+B is not vectorized in this version: after `b.permute(1, 0)`, its contiguous dimension is N,
+while the copy layout iterates along K. In v3, B is laid out directly as `(K, N)` with
+strides `(N, 1)`.
 
 With all these improvements, let's benchmark `gemm_kernel_v2`.
 
@@ -687,8 +687,8 @@ and `ldmatrix`.
 
 This section will explain all improvements that have been done in the kernel `gemm_kernel_v3`. There have been a lot of them
 and I will not be able to go in-depth. Here is the exhaustive list:
-- use of `shared memory` as buffer for loading and storing in `global memory` the elements from `C` and `D`
-- use of `swizzling` in `shared memory` to avoid bank conflicts related to `ldmatrix` and `stmatrix`
+- use of `swizzling` in `shared memory` to avoid bank conflicts related to `ldmatrix` and
+  `stmatrix`, with the corrected `Swizzle(1, 3, 3)` (see the note in §IV-C)
 - use of `cp.async` and multi staging for loading tiles of `A` and `B` in shared memory
 - use of `buffering` for `cute.gemm(...)` by dividing the dimension `bs_k` in smaller tiles adapted to the tensor cores (
     helps in hiding latency
@@ -714,7 +714,7 @@ The benchmark produces the following results with square matrices (clock at `2.3
 | Throughput (M = 2048) | ~71.1 TFLOP/s | ~74.4 TFLOP/s |
 | Throughput (M = 4096) | ~75.3 TFLOP/s | ~77.4 TFLOP/s |
 
-There is now a maximum of `3%` of difference between my last kernel and the `cuBLAS` reference routed by PyTorch.
+There is now a maximum of `4.5%` of difference between my last kernel and the `cuBLAS` reference routed by PyTorch.
 This a great milestone. The swizzling implemented held the most gains while the coalesced accesses allowed for a `5%`
 improvement.
 
@@ -746,7 +746,14 @@ Indeed, to further emphasize on the bottleneck coming from the tensor core pipel
 HMMA.16816.F32.BF16 R36, R56, R48, R36
 ```
 This line is reponsible of `13.71%` of total attributed stalls. A huge majority of them are `Math Pipe Throttle`.
-The first instruction of each new loop awaits for the former instruction to be finished.
+
+Math Pipe Throttle means warps wait for the tensor-core pipe to be available, which is expected in a compute-bound kernel.
 
 
 # VI/ Conclusion
+
+In conclusion, I was able, step by step, to implement an efficient GEMM in BF16 for a GPU on the architecture `sm120`.
+However, despite this, there exists a small difference between the performance of my kernel on cuBLAS.
+
+I leave the last improvements to a future repo, especially low-precision GEMM. Indeed, as precision decreases, the
+maximum theorical throughput increases substantially, meaning that a 4.5% difference can lead to a significant loss.
